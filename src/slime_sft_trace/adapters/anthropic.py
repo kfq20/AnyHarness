@@ -286,6 +286,64 @@ def _build_reply_parts_from_blocks(
     return manager_message, stop_reason
 
 
+def chat_response_to_blocks(response: Any) -> tuple[list[dict], str]:
+    """Convert a litellm/openai chat-completions response to Anthropic content blocks.
+
+    chat mode routes through ``litellm.acompletion``, whose response is an
+    OpenAI ``ModelResponse``. We re-shape it into the Anthropic content blocks
+    that the messages-mode reply path already understands
+    (:func:`_build_reply_parts_from_blocks` builds the manager_message from
+    them, and ``_respond`` renders them back to Claude Code). This keeps chat
+    mode on the *same* trajectory + dump path as messages mode.
+
+    Tool-call arguments are normalized from the JSON **string** that litellm
+    emits (live-API shape) to a **dict** (the HF/tree shape ``tool_call_dict``
+    expects), so the stored turn matches its replay.
+
+    Returns ``(blocks, stop_reason)`` where ``stop_reason`` is the Anthropic
+    value (``tool_use`` / ``end_turn`` / ``max_tokens``).
+    """
+    choices = getattr(response, "choices", None) or []
+    if not choices:
+        return [{"type": "text", "text": ""}], "end_turn"
+    msg = getattr(choices[0], "message", None)
+    finish = getattr(choices[0], "finish_reason", None) or "stop"
+
+    blocks: list[dict] = []
+    # reasoning_content (if the chat endpoint returns it — e.g. via litellm's
+    # reasoning extraction) -> a thinking block.
+    reasoning = getattr(msg, "reasoning_content", None) or getattr(msg, "reasoning", None)
+    if reasoning:
+        blocks.append({"type": "thinking", "thinking": reasoning})
+    content = getattr(msg, "content", None)
+    if content:
+        blocks.append({"type": "text", "text": content})
+    for tc in getattr(msg, "tool_calls", None) or []:
+        fn = getattr(tc, "function", None)
+        name = getattr(fn, "name", None) if fn else None
+        args = getattr(fn, "arguments", None) if fn else None
+        # litellm emits arguments as a JSON string; the tree stores a dict.
+        if isinstance(args, str):
+            try:
+                args = json.loads(args) if args else {}
+            except (ValueError, TypeError):
+                args = {"_raw": args}
+        if not isinstance(args, dict):
+            args = args if isinstance(args, dict) else {}
+        blocks.append({"type": "tool_use", "id": getattr(tc, "id", None) or "", "name": name or "tool", "input": args})
+
+    if not blocks:
+        blocks.append({"type": "text", "text": ""})
+
+    if any(b.get("type") == "tool_use" for b in blocks):
+        stop_reason = "tool_use"
+    elif finish in ("length", "max_tokens"):
+        stop_reason = "max_tokens"
+    else:
+        stop_reason = "end_turn"
+    return blocks, stop_reason
+
+
 # --- Request framing: session id + wire response/stream rendering ---
 
 

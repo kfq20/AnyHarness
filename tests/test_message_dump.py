@@ -1020,3 +1020,66 @@ def test_tool_result_blanked_does_not_fork():
     # real tool content survives into the dump (not "")
     tool_content = [m["content"] for m in samples[0].prompt if m["role"] == "tool"]
     assert tool_content == ["a.txt\nb.txt"], f"real tool result lost: {tool_content}"
+
+
+# ---------------------------------------------------------------------------
+# chat upstream mode (litellm.acompletion) — pure-function transform tests
+# ---------------------------------------------------------------------------
+
+
+def test_chat_response_to_blocks_tool_call_dict_args():
+    """litellm emits tool_calls.arguments as a JSON STRING; chat_response_to_blocks
+    must normalize to a dict (the tree/dump shape) and emit tool_use blocks."""
+    from slime_sft_trace.adapters.anthropic import chat_response_to_blocks
+
+    class _Fn:
+        name = "Read"
+        arguments = '{"file_path": "/tmp/x.py"}'  # string, as litellm emits
+
+    class _TC:
+        id = "call_1"
+        type = "function"
+        function = _Fn()
+
+    class _Msg:
+        content = "reading"
+        tool_calls = [_TC()]
+        reasoning_content = "plan"
+
+    class _Choice:
+        finish_reason = "tool_calls"
+        message = _Msg()
+
+    class _Resp:
+        choices = [_Choice()]
+
+    blocks, stop = chat_response_to_blocks(_Resp())
+    types = [b["type"] for b in blocks]
+    assert "thinking" in types and "text" in types and "tool_use" in types
+    tu = next(b for b in blocks if b["type"] == "tool_use")
+    assert tu["name"] == "Read"
+    assert tu["input"] == {"file_path": "/tmp/x.py"}  # dict, not str
+    assert tu["id"] == "call_1"
+    assert stop == "tool_use"
+
+
+def test_stringify_tool_call_args_serializes_dict_for_wire():
+    """_stringify_tool_call_args turns dict arguments into a JSON string for the
+    chat upstream (some endpoints reject dict args in replayed history), without
+    touching the original messages."""
+    from slime_sft_trace.adapters.common import _stringify_tool_call_args
+
+    original = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "u"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "Read", "arguments": {"file_path": "/a"}}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "r"},
+    ]
+    wire = _stringify_tool_call_args(original)
+    # original untouched (dict)
+    assert isinstance(original[2]["tool_calls"][0]["function"]["arguments"], dict)
+    # wire has string args
+    assert wire[2]["tool_calls"][0]["function"]["arguments"] == '{"file_path": "/a"}'
+    # non-assistant messages pass through unchanged
+    assert wire[3] == original[3]

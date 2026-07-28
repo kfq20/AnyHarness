@@ -112,6 +112,37 @@ def flatten_content(c: Any) -> str:
     return "\n\n".join(p for p in parts if p)
 
 
+def _stringify_tool_call_args(messages: list[dict]) -> list[dict]:
+    """Return a copy of ``messages`` with every assistant ``tool_calls[].function.arguments``
+    serialized to a JSON string (the OpenAI live-API shape).
+
+    The tree stores arguments as a dict (HF shape), but some OpenAI-compatible
+    upstreams reject dict arguments in a replayed assistant message. This is a
+    wire-only transform for the chat upstream; the tree is untouched (dict).
+    """
+    out: list[dict] = []
+    for m in messages:
+        if not isinstance(m, dict) or m.get("role") != "assistant" or not isinstance(m.get("tool_calls"), list):
+            out.append(m)
+            continue
+        m2 = dict(m)
+        tcs = []
+        for tc in m["tool_calls"]:
+            if isinstance(tc, dict):
+                tc2 = dict(tc)
+                fn = tc2.get("function")
+                if isinstance(fn, dict) and isinstance(fn.get("arguments"), dict):
+                    fn = dict(fn)
+                    fn["arguments"] = json.dumps(fn["arguments"], ensure_ascii=False)
+                    tc2["function"] = fn
+                tcs.append(tc2)
+            else:
+                tcs.append(tc)
+        m2["tool_calls"] = tcs
+        out.append(m2)
+    return out
+
+
 def tool_call_dict(name: str, arguments: dict | None) -> dict:
     """Canonical OpenAI-shape tool call stored on manager_message.
 
@@ -159,8 +190,8 @@ class BaseAdapter:
         # upstream backend: "sglang" (default) POSTs /generate with return_logprob;
         # "messages" forwards the raw /v1/messages body to an arbitrary messages API.
         mode = os.environ.get("UPSTREAM_MODE", "sglang").strip().lower() or "sglang"
-        if mode not in ("sglang", "messages"):
-            raise ValueError(f"UPSTREAM_MODE={mode!r} must be 'sglang' or 'messages'")
+        if mode not in ("sglang", "messages", "chat"):
+            raise ValueError(f"UPSTREAM_MODE={mode!r} must be 'sglang', 'messages', or 'chat'")
         self.upstream_mode = mode
         self.tool_parser = tool_parser
         self.reasoning_parser = reasoning_parser
@@ -205,6 +236,9 @@ class BaseAdapter:
         session: Any,
         body: dict,
         session_id: str | None,
+        *,
+        translated: list[dict] | None = None,
+        tools_schema: list[dict] | None = None,
     ) -> TurnRecord:
         """Forward one turn to the configured upstream backend and pack the reply.
 
@@ -221,6 +255,11 @@ class BaseAdapter:
           stream/non-stream response, and re-tokenize it so the downstream
           tree/parser see real output tokens. No logprobs are available in this
           mode, so ``output_log_probs`` is ``[]`` (message-level SFT only).
+        * ``chat``: route the chat-completions shape (the tree's hub format) to
+          ``litellm.acompletion`` against ``SLIME_CHAT_BASE_URL`` (any
+          OpenAI-compatible endpoint). litellm picks the wire format; the
+          response is re-shaped to Anthropic content blocks and replayed through
+          the messages-mode reply path. No logprobs (message-level SFT only).
         """
         if self.upstream_mode == "messages":
             turn, blocks = await self._call_messages_upstream(body, session_id)
@@ -228,6 +267,8 @@ class BaseAdapter:
             # manager_message (Anthropic wire) instead of re-parsing decoded text.
             self._last_content_blocks = blocks
             return turn
+        if self.upstream_mode == "chat":
+            return await self._call_chat_upstream(translated, tools_schema, body, session_id)
         return await call_sglang_generate(
             prompt_ids, session, body, adapter=self, session_id=session_id
         )
@@ -321,6 +362,86 @@ class BaseAdapter:
             finish_reason=finish,
             output_log_probs=[],
         ), content_blocks
+
+    async def _call_chat_upstream(
+        self,
+        translated: list[dict],
+        tools_schema: list[dict] | None,
+        body: dict,
+        session_id: str | None,
+    ) -> TurnRecord:
+        """Route one turn through litellm.acompletion (OpenAI-compatible upstream).
+
+        chat mode hands the *chat-completions* shape (the tree's internal hub
+        format — already produced by ``_translate_messages``) to
+        ``litellm.acompletion``, letting litellm pick the provider/wire format.
+        The response is re-shaped to Anthropic content blocks via
+        :func:`chat_response_to_blocks`, stashed on ``self._last_content_blocks``
+        so ``_run_turn``'s messages-mode reply path builds the manager_message
+        (with tool_calls / reasoning_content) and renders the Anthropic response
+        back to Claude Code. No logprobs (message-level SFT only).
+
+        Env: ``SLIME_CHAT_BASE_URL``, ``SLIME_CHAT_API_KEY``, ``SLIME_CHAT_MODEL``
+        (e.g. an OpenAI-compatible gateway). Auth from the inbound request
+        (Authorization/x-api-key) is forwarded via ``api_key`` when no explicit
+        key is set, so a client's own credential reaches the upstream.
+        """
+        import litellm
+
+        from slime_sft_trace.adapters.anthropic import chat_response_to_blocks
+
+        base_url = os.environ.get("SLIME_CHAT_BASE_URL") or ""
+        model = os.environ.get("SLIME_CHAT_MODEL") or "gpt-4o"
+        api_key = os.environ.get("SLIME_CHAT_API_KEY") or self._inbound_auth.get("authorization") or ""
+        # strip "Bearer " prefix if we forwarded the raw Authorization header
+        if api_key.lower().startswith("bearer "):
+            api_key = api_key[7:]
+        if not base_url:
+            raise RuntimeError("UPSTREAM_MODE=chat requires SLIME_CHAT_BASE_URL")
+
+        # Some OpenAI-compatible upstreams (e.g. mintcn) reject `tool_calls`
+        # whose `function.arguments` is a *dict* in a replayed assistant message
+        # (502), while accepting a JSON *string* (the OpenAI live-API shape). The
+        # tree stores dict args (HF shape), so normalize to a JSON string for the
+        # wire unless the caller opts out via SLIME_CHAT_ARGS_AS_DICT=1. litellm
+        # does NOT re-serialize pre-existing tool_calls on the request, so we must.
+        args_as_dict = os.environ.get("SLIME_CHAT_ARGS_AS_DICT", "") == "1"
+        wire_messages = translated if args_as_dict else _stringify_tool_call_args(translated)
+
+        # litellm routes to an OpenAI-compatible endpoint via "openai/<model>".
+        # tools_schema is already OpenAI function-tool shape ({type,function:{...}}).
+        kwargs: dict[str, Any] = {
+            "model": f"openai/{model}",
+            "messages": wire_messages,
+            "stream": False,
+            "api_base": base_url,
+            "api_key": api_key,
+        }
+        if tools_schema:
+            kwargs["tools"] = tools_schema
+        if body.get("max_tokens"):
+            kwargs["max_tokens"] = int(body["max_tokens"])
+        # forward anthropic-version etc. as extra headers where supported
+        extra = {k: v for k, v in self._inbound_auth.items() if k.lower() not in ("authorization",)}
+        if extra:
+            kwargs["extra_headers"] = extra
+
+        try:
+            response = await litellm.acompletion(**kwargs)
+        except Exception as exc:
+            self.logger.warning("[%s] sid=%s chat upstream failed: %s", self.log_prefix, session_id, exc)
+            raise
+
+        blocks, stop_reason = chat_response_to_blocks(response)
+        self._last_content_blocks = blocks
+        # map Anthropic stop_reason -> sglang finish_reason shape (tool_use->tool_calls etc.)
+        finish = {
+            "max_tokens": "length",
+            "end_turn": "stop",
+            "stop_sequence": "stop",
+            "tool_use": "tool_calls",
+        }.get(stop_reason, stop_reason or "stop")
+        return TurnRecord(prompt_ids=[], output_ids=[], finish_reason=finish, output_log_probs=[])
 
     def _reply_from_content_blocks(
         self, blocks: list[dict], finish: str, tools_schema: list[dict] | None
@@ -437,7 +558,7 @@ class BaseAdapter:
         # doing so, leaving nothing for a message-level fallback to read. So in
         # messages mode we branch to the message-level path BEFORE touching
         # get_trajectory; the token path below is unchanged for sglang mode.
-        if self.upstream_mode == "messages":
+        if self.upstream_mode in ("messages", "chat"):
             return self._finish_messages_session(
                 sid, base_sample=base_sample, reward=reward, extra_metadata=extra_metadata
             )
@@ -567,7 +688,7 @@ class BaseAdapter:
                 for k, v in request.headers.items()
                 if k.lower() in ("authorization", "x-api-key", "x-goog-api-key", "anthropic-version")
             }
-            turn = await self._call_upstream(prompt_ids, s, body, sid)
+            turn = await self._call_upstream(prompt_ids, s, body, sid, translated=translated, tools_schema=tools_schema)
 
             raw_output = (
                 tok.decode(turn.output_ids, skip_special_tokens=False)
@@ -579,13 +700,13 @@ class BaseAdapter:
                 tool_parser_name=self.tool_parser,
                 reasoning_parser_name=self.reasoning_parser,
             )
-            # messages-mode: the upstream returned Anthropic-structured content
-            # blocks (tool_use/thinking/text), which parse_model_output CANNOT
-            # recover from decoded text. Build the manager_message directly from
-            # those blocks so tool_calls + reasoning_content survive into the
+            # messages-mode / chat-mode: the upstream returned Anthropic-structured
+            # content blocks (tool_use/thinking/text), which parse_model_output
+            # CANNOT recover from decoded text. Build the manager_message directly
+            # from those blocks so tool_calls + reasoning_content survive into the
             # trajectory (and thus the SFT dump). sglang mode has no blocks and
             # falls through to the parsed reply (unchanged).
-            if self.upstream_mode == "messages" and self._last_content_blocks:
+            if self.upstream_mode in ("messages", "chat") and self._last_content_blocks:
                 reply = self._reply_from_content_blocks(self._last_content_blocks, turn.finish_reason, tools_schema)
                 self._last_content_blocks = []
             else:
