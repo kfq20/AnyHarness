@@ -60,6 +60,9 @@ class AnthropicAdapter(BaseAdapter):
     def _register_routes(self, app: web.Application) -> None:
         app.router.add_post("/v1/messages", self._run_turn)
         app.router.add_post("/v1/messages/count_tokens", _count_tokens)
+        # OpenAI chat-completions downstream: lets harnesses that speak
+        # chat-completions (OpenAI Agents SDK, smolagents, ...) connect.
+        app.router.add_post("/v1/chat/completions", self._run_chat_turn)
 
     def _session_id(self, request: web.Request, body: dict) -> str:
         return _request_session_id(request)
@@ -85,6 +88,69 @@ class AnthropicAdapter(BaseAdapter):
         if stream:
             return await _render_stream(request, blocks, stop_reason, in_tok, out_tok)
         return web.json_response(_render_response(body, blocks, stop_reason, in_tok, out_tok))
+
+    # -- chat-completions downstream (OpenAI wire format) --------------------
+
+    async def _run_chat_turn(self, request: web.Request) -> web.StreamResponse:
+        """Handle /v1/chat/completions: the OpenAI chat-completions wire format.
+
+        Reuses _run_turn with downstream_format="chat" so translate + respond
+        use the OpenAI shape (the tree's hub format) directly, without the
+        Anthropic round-trip.
+        """
+        return await self._run_turn(request, downstream_format="chat")
+
+    def _translate_chat(self, body: dict) -> tuple[list[dict], list[dict] | None]:
+        """Translate an OpenAI chat-completions request to the tree's hub format.
+
+        chat-completions messages are ALREADY the OpenAI shape the tree stores
+        ({role, content, tool_calls, tool_call_id}), so we pass them through
+        with only ToolMessage wrapping on tool-role messages (so tool_result
+        content trimming doesn't fork, same as the Anthropic path).
+        """
+        messages = body.get("messages") or []
+        translated: list[dict] = []
+        for m in messages:
+            if not isinstance(m, dict):
+                continue
+            role = m.get("role")
+            if role == "tool":
+                translated.append(ToolMessage(role="tool", content=m.get("content", ""),
+                                             tool_call_id=m.get("tool_call_id", "")))
+            else:
+                translated.append(m)
+        tools_schema = body.get("tools")  # already OpenAI function-tool shape
+        return translated, tools_schema
+
+    async def _respond_chat(self, request, body, reply, in_tok, out_tok, stream) -> web.StreamResponse:
+        """Render the reply as an OpenAI chat-completions response.
+
+        The manager_message IS already the OpenAI assistant-message shape
+        ({role, content, tool_calls, reasoning_content}), so we wrap it in the
+        choices envelope. finish_reason maps from the internal finish to the
+        OpenAI vocabulary (tool_calls -> "tool_calls", length -> "length").
+        """
+        mm = reply.manager_message
+        fr = reply.finish_reason
+        openai_finish = {"tool_calls": "tool_calls", "length": "length"}.get(fr, "stop")
+        msg = {"role": "assistant", "content": mm.get("content", "")}
+        if mm.get("tool_calls"):
+            msg["tool_calls"] = mm["tool_calls"]
+        if mm.get("reasoning_content"):
+            msg["reasoning_content"] = mm["reasoning_content"]
+        resp = {
+            "id": f"chatcmpl_{secrets.token_hex(12)}",
+            "object": "chat.completion",
+            "model": body.get("model", "slime-actor"),
+            "choices": [{"index": 0, "message": msg, "finish_reason": openai_finish}],
+            "usage": {"prompt_tokens": in_tok, "completion_tokens": out_tok, "total_tokens": in_tok + out_tok},
+        }
+        if stream:
+            # minimal SSE: one chunk with the delta, then [DONE]
+            chunk = {"id": resp["id"], "object": "chat.completion.chunk", "model": resp["model"],
+                    "choices": [{"index": 0, "delta": msg, "finish_reason": None}]}
+            return await _sse_stream(request, [chunk, {"choices": [{"index": 0, "delta": {}, "finish_reason": openai_finish}]}])
+        return web.json_response(resp)
 
 
 # --- Translation (Anthropic wire -> chat-template messages) ---
@@ -360,6 +426,18 @@ def _request_session_id(request: web.Request) -> str:
     if sid:
         return sid
     return sid_from_bearer(request) or (request.headers.get("X-Api-Key") or "").strip() or "default"
+
+
+async def _sse_stream(request: web.Request, chunks: list[dict]) -> web.StreamResponse:
+    """Emit OpenAI-style SSE chunks (data: {json}\\n\\n) + [DONE]."""
+    resp = web.StreamResponse(status=200, headers={
+        "Content-Type": "text/event-stream", "Cache-Control": "no-cache",
+    })
+    await resp.prepare(request)
+    for chunk in chunks:
+        await resp.write(f"data: {json.dumps(chunk)}\n\n".encode())
+    await resp.write(b"data: [DONE]\n\n")
+    return resp
 
 
 def _render_response(body: dict, blocks: list[dict], stop_reason: str, in_tok: int, out_tok: int) -> dict:

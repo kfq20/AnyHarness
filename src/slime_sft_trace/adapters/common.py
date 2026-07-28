@@ -391,6 +391,11 @@ class BaseAdapter:
         from slime_sft_trace.adapters.anthropic import chat_response_to_blocks
 
         base_url = os.environ.get("SLIME_CHAT_BASE_URL") or ""
+        # litellm appends /chat/completions to api_base, so it must end with /v1.
+        # If the caller gave a bare origin, append /v1; if already /v1, keep it.
+        base_url = base_url.rstrip("/")
+        if not base_url.endswith("/v1"):
+            base_url = base_url + "/v1"
         model = os.environ.get("SLIME_CHAT_MODEL") or "gpt-4o"
         api_key = os.environ.get("SLIME_CHAT_API_KEY") or self._inbound_auth.get("authorization") or ""
         # strip "Bearer " prefix if we forwarded the raw Authorization header
@@ -650,12 +655,15 @@ class BaseAdapter:
         except Exception:
             self.logger.exception("debug_callback failed (sid=%s)", sid)
 
-    async def _run_turn(self, request: web.Request) -> web.StreamResponse:
+    async def _run_turn(self, request: web.Request, *, downstream_format: str = "messages") -> web.StreamResponse:
         """One full agent turn: translate -> sglang -> parse -> append -> respond.
 
         The wire-specific steps are delegated to the subclass hooks; the rest
         (sid resolution, closed/cap guards, inflight tracking, record_turn) is
         shared across protocols.
+
+        ``downstream_format`` selects the request/response wire shape: "messages"
+        (Anthropic /v1/messages, the default) or "chat" (OpenAI /v1/chat/completions).
         """
         body = await request.json()
         self._preprocess_body(body)
@@ -673,7 +681,10 @@ class BaseAdapter:
         self.inflight.setdefault(sid, set()).add(task)
         t0 = time.monotonic()
         try:
-            translated, tools_schema = self._translate(body)
+            if downstream_format == "chat":
+                translated, tools_schema = self._translate_chat(body)
+            else:
+                translated, tools_schema = self._translate(body)
             prompt_ids = (
                 _render_token_ids(translated, tok, tools=tools_schema, add_generation_prompt=True)
                 if tok is not None else []
@@ -720,7 +731,10 @@ class BaseAdapter:
             # disconnected during generation makes _respond raise here, and we
             # must not record a turn the client never received.
             try:
-                response = await self._respond(request, body, reply, in_tok, out_tok, stream)
+                if downstream_format == "chat":
+                    response = await self._respond_chat(request, body, reply, in_tok, out_tok, stream)
+                else:
+                    response = await self._respond(request, body, reply, in_tok, out_tok, stream)
             except (ConnectionResetError, asyncio.CancelledError) as e:
                 self.logger.warning(
                     "[%s] sid=%s client disconnected before response flush: %s after %.1fs",
