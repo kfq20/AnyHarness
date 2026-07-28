@@ -1,8 +1,8 @@
-# slime-sft-trace — the HiLR (Harness-in-the-Loop) layer
+# slime-sft-trace — AnyHarness
 
 Build SFT training trajectories from a coding agent's `/v1/messages` traffic.
 
-**HiLR — Harness-in-the-Loop layer** is the architectural name for the layer
+**AnyHarness** is the architectural name for the layer
 between a harness (Claude Code) and the sampling endpoint / API server. It
 manages the harness↔upstream contract: the adapter exposes `/v1/messages`
 downstream to Claude Code, forwards upstream to a pluggable backend

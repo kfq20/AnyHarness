@@ -1,6 +1,6 @@
-"""Anthropic Messages adapter for agent rollouts — the HiLR core.
+"""Anthropic Messages adapter for agent rollouts — the AnyHarness core.
 
-HiLR (Harness-in-the-Loop layer) is the layer between a harness (Claude Code)
+AnyHarness is the layer between a harness (Claude Code)
 and the sampling endpoint / API server. This adapter is its core: it exposes
 ``/v1/messages`` (and ``/v1/messages/count_tokens``) downstream to the harness,
 forwards each turn upstream to a pluggable backend (sglang ``/generate`` with

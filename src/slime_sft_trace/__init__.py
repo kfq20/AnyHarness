@@ -1,6 +1,6 @@
-"""slime_sft_trace — the HiLR (Harness-in-the-Loop) layer.
+"""slime_sft_trace — AnyHarness.
 
-HiLR is the layer between a harness (Claude Code) and the sampling endpoint /
+AnyHarness is the layer between a harness (Claude Code) and the sampling endpoint /
 API server: the :class:`~slime_sft_trace.adapters.AnthropicAdapter` exposes
 ``/v1/messages`` downstream to the harness, forwards upstream to a pluggable
 backend (sglang with per-token logprobs, or any messages-API), and captures
