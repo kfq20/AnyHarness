@@ -63,6 +63,9 @@ class AnthropicAdapter(BaseAdapter):
         # OpenAI chat-completions downstream: lets harnesses that speak
         # chat-completions (OpenAI Agents SDK, smolagents, ...) connect.
         app.router.add_post("/v1/chat/completions", self._run_chat_turn)
+        # OpenAI Responses API downstream: lets harnesses that speak the
+        # Responses API (Codex CLI, OpenAI Agents SDK default mode) connect.
+        app.router.add_post("/v1/responses", self._run_responses_turn)
 
     def _session_id(self, request: web.Request, body: dict) -> str:
         return _request_session_id(request)
@@ -150,6 +153,108 @@ class AnthropicAdapter(BaseAdapter):
             chunk = {"id": resp["id"], "object": "chat.completion.chunk", "model": resp["model"],
                     "choices": [{"index": 0, "delta": msg, "finish_reason": None}]}
             return await _sse_stream(request, [chunk, {"choices": [{"index": 0, "delta": {}, "finish_reason": openai_finish}]}])
+        return web.json_response(resp)
+
+    # -- responses downstream (OpenAI Responses API wire format) ------------
+
+    async def _run_responses_turn(self, request: web.Request) -> web.StreamResponse:
+        """Handle /v1/responses: the OpenAI Responses API format (Codex CLI, Agents SDK)."""
+        return await self._run_turn(request, downstream_format="responses")
+
+    def _translate_responses(self, body: dict) -> tuple[list[dict], list[dict] | None]:
+        """Translate a Responses API request to the tree's hub format.
+
+        Responses API ``input`` is either a string or a list of items (messages
+        + function_call + function_call_output). We convert to the OpenAI
+        chat-completions message shape the tree stores.
+
+        Item types in input:
+        - {type:"message", role, content:[{type:"input_text"/"output_text", text}]}
+        - {type:"function_call", name, arguments(str), call_id}
+        - {type:"function_call_output", call_id, output(str)}
+        """
+        raw_input = body.get("input")
+        if isinstance(raw_input, str):
+            return [{"role": "user", "content": raw_input}], body.get("tools")
+
+        translated: list[dict] = []
+        instructions = body.get("instructions")
+        if instructions:
+            translated.append({"role": "system", "content": instructions})
+
+        for item in (raw_input or []):
+            if not isinstance(item, dict):
+                continue
+            itype = item.get("type")
+            if itype == "message":
+                role = item.get("role", "user")
+                content_parts = item.get("content") or []
+                # content is a list of {type:"input_text"/"output_text", text}
+                if isinstance(content_parts, str):
+                    translated.append({"role": role, "content": content_parts})
+                else:
+                    texts = [p.get("text", "") for p in content_parts if isinstance(p, dict)]
+                    translated.append({"role": role, "content": "".join(texts)})
+            elif itype == "function_call":
+                # assistant tool call — arguments is a JSON string
+                args = item.get("arguments", "{}")
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args) if args else {}
+                    except (ValueError, TypeError):
+                        args = {"_raw": args}
+                translated.append({"role": "assistant", "content": "",
+                    "tool_calls": [{"id": item.get("call_id", ""),
+                        "type": "function",
+                        "function": {"name": item.get("name", ""), "arguments": args}}]})
+            elif itype == "function_call_output":
+                # tool result — output is a string
+                translated.append(ToolMessage(role="tool",
+                    content=item.get("output", ""),
+                    tool_call_id=item.get("call_id", "")))
+
+        # tools in Responses API use the same function shape
+        return translated, body.get("tools")
+
+    async def _respond_responses(self, request, body, reply, in_tok, out_tok, stream) -> web.StreamResponse:
+        """Render the reply as an OpenAI Responses API response.
+
+        The manager_message (chat shape) is converted to Responses output items:
+        - text content -> ResponseOutputMessage with output_text parts
+        - tool_calls -> ResponseFunctionToolCall items
+        """
+        mm = reply.manager_message
+        fr = reply.finish_reason
+        resp_id = f"resp_{secrets.token_hex(12)}"
+        model = body.get("model", "slime-actor")
+
+        output: list[dict] = []
+        msg_item: dict[str, Any] = {"id": f"msg_{secrets.token_hex(8)}", "type": "message", "role": "assistant", "status": "completed"}
+        content_parts = []
+        if mm.get("reasoning_content"):
+            # reasoning as a separate item (simplified — not full reasoning API)
+            output.append({"id": f"rs_{secrets.token_hex(8)}", "type": "reasoning", "summary": [{"type": "summary_text", "text": mm["reasoning_content"]}]})
+        if mm.get("content"):
+            content_parts.append({"type": "output_text", "text": mm["content"]})
+        msg_item["content"] = content_parts
+        output.append(msg_item)
+
+        # function_call items from tool_calls
+        for tc in mm.get("tool_calls") or []:
+            fn = tc.get("function", {})
+            args = fn.get("arguments", {})
+            if isinstance(args, dict):
+                args = json.dumps(args, ensure_ascii=False)
+            output.append({"id": f"fc_{secrets.token_hex(8)}", "type": "function_call",
+                "call_id": tc.get("id", ""), "name": fn.get("name", ""), "arguments": args})
+
+        status = "completed" if fr not in ("length",) else "incomplete"
+        resp = {
+            "id": resp_id, "object": "response", "model": model,
+            "output": output, "status": status,
+            "usage": {"input_tokens": in_tok, "output_tokens": out_tok, "total_tokens": in_tok + out_tok},
+        }
+        # TODO: streaming (Responses SSE is complex — response.created, output_item.added, etc.)
         return web.json_response(resp)
 
 

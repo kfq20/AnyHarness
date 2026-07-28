@@ -811,6 +811,8 @@ class BaseAdapter:
         try:
             if downstream_format == "chat":
                 translated, tools_schema = self._translate_chat(body)
+            elif downstream_format == "responses":
+                translated, tools_schema = self._translate_responses(body)
             else:
                 translated, tools_schema = self._translate(body)
             prompt_ids = (
@@ -861,6 +863,8 @@ class BaseAdapter:
             try:
                 if downstream_format == "chat":
                     response = await self._respond_chat(request, body, reply, in_tok, out_tok, stream)
+                elif downstream_format == "responses":
+                    response = await self._respond_responses(request, body, reply, in_tok, out_tok, stream)
                 else:
                     response = await self._respond(request, body, reply, in_tok, out_tok, stream)
             except (ConnectionResetError, asyncio.CancelledError) as e:
