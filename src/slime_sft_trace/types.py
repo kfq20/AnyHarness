@@ -37,6 +37,9 @@ class Sample:
     reward: float | dict[str, Any] | None = None
     loss_mask: list[int] | None = None
     rollout_log_probs: list[float] | None = None  # Log probabilities from rollout engine
+    # top-k alternative logprobs per output token: list of [(logprob, token_id), ...]
+    # None when SLIME_TOP_LOGPROBS not set; enables nucleus-replay / offline resampling RL.
+    output_top_logprobs: list[list[tuple[float, int]]] | None = None
     teacher_log_probs: list[float] | None = None  # Log probabilities from teacher model for OPD
 
     class Status(Enum):

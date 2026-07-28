@@ -223,6 +223,8 @@ class BaseAdapter:
         # reasoning_content directly from Anthropic wire (parse_model_output can't
         # recover tool_use blocks from decoded text — it expects model-gen syntax).
         self._last_content_blocks: list[dict] = []
+        # sglang-only: per-turn top-k alternative logprobs (from output_top_logprobs)
+        self._last_top_logprobs: list | None = None
 
         self.app.router.add_get("/healthz", _health)
         self.app.router.add_get("/v1/models", _health)
@@ -263,15 +265,17 @@ class BaseAdapter:
         """
         if self.upstream_mode == "messages":
             turn, blocks = await self._call_messages_upstream(body, session_id)
-            # stash content blocks for _run_turn to build a structured
-            # manager_message (Anthropic wire) instead of re-parsing decoded text.
             self._last_content_blocks = blocks
             return turn
         if self.upstream_mode == "chat":
             return await self._call_chat_upstream(translated, tools_schema, body, session_id)
-        return await call_sglang_generate(
+        # sglang: call_sglang_generate returns (TurnRecord, top_k_logprobs|None)
+        turn, top_k = await call_sglang_generate(
             prompt_ids, session, body, adapter=self, session_id=session_id
         )
+        # stash per-turn top-k logprobs for _run_turn to attach to the record.
+        self._last_top_logprobs = top_k
+        return turn
 
     async def _call_messages_upstream(
         self,
@@ -431,6 +435,15 @@ class BaseAdapter:
         if extra:
             kwargs["extra_headers"] = extra
 
+        # Request logprobs from the chat upstream (vLLM + SGLang /v1/chat/completions
+        # both support logprobs=True + top_logprobs). Disabled by default; enable via
+        # SLIME_CHAT_LOGPROBS=1 (sets logprobs=True) + SLIME_CHAT_TOP_LOGPROBS=N (top-k).
+        if os.environ.get("SLIME_CHAT_LOGPROBS") == "1":
+            kwargs["logprobs"] = True
+            top_k = int(os.environ.get("SLIME_CHAT_TOP_LOGPROBS", "0") or "0")
+            if top_k > 0:
+                kwargs["top_logprobs"] = top_k
+
         try:
             response = await litellm.acompletion(**kwargs)
         except Exception as exc:
@@ -439,6 +452,25 @@ class BaseAdapter:
 
         blocks, stop_reason = chat_response_to_blocks(response)
         self._last_content_blocks = blocks
+
+        # Extract per-token logprobs from the chat response (OpenAI shape:
+        # choices[0].logprobs.content = [{token, logprob, top_logprobs:[...]}]).
+        # Pack into output_log_probs for the TurnRecord. top_logprobs_num on the
+        # TurnRecord is left to the sglang path; chat stores the sampled-token
+        # logprob only (sufficient for GRPO; top-k is in the response object if needed).
+        output_log_probs: list[float] = []
+        if os.environ.get("SLIME_CHAT_LOGPROBS") == "1":
+            try:
+                choice = response.choices[0]
+                lp = getattr(choice, "logprobs", None)
+                if lp and getattr(lp, "content", None):
+                    for entry in lp.content:
+                        lp_val = getattr(entry, "logprob", None)
+                        if lp_val is not None:
+                            output_log_probs.append(float(lp_val))
+            except (AttributeError, IndexError, TypeError):
+                pass  # upstream didn't return logprobs despite the request
+
         # map Anthropic stop_reason -> sglang finish_reason shape (tool_use->tool_calls etc.)
         finish = {
             "max_tokens": "length",
@@ -446,7 +478,7 @@ class BaseAdapter:
             "stop_sequence": "stop",
             "tool_use": "tool_calls",
         }.get(stop_reason, stop_reason or "stop")
-        return TurnRecord(prompt_ids=[], output_ids=[], finish_reason=finish, output_log_probs=[])
+        return TurnRecord(prompt_ids=[], output_ids=[], finish_reason=finish, output_log_probs=output_log_probs)
 
     def _reply_from_content_blocks(
         self, blocks: list[dict], finish: str, tools_schema: list[dict] | None
@@ -580,6 +612,10 @@ class BaseAdapter:
             s.response = (
                 self.tokenizer.decode(s.tokens[-rlen:], skip_special_tokens=False) if rlen and s.tokens else ""
             )
+            # attach per-turn top-k logprobs from the last sglang turn (if collected)
+            if self._last_top_logprobs is not None:
+                s.output_top_logprobs = self._last_top_logprobs
+        self._last_top_logprobs = None
         return samples
 
     def _finish_messages_session(
@@ -858,6 +894,9 @@ async def call_sglang_generate(
     rid = uuid.uuid4().hex
     headers = {"X-SMG-Routing-Key": session_id} if session_id and session_id != "default" else None
     timeout = aiohttp.ClientTimeout(total=None, sock_read=900)
+    # top-k logprobs: env SLIME_TOP_LOGPROBS=N requests the top-N alternative
+    # tokens per position from sglang (output_top_logprobs in meta_info).
+    top_logprobs_num = int(os.environ.get("SLIME_TOP_LOGPROBS", "0") or "0")
     try:
         async with aiohttp.ClientSession(timeout=timeout) as sess, sess.post(
             f"{sglang_url}/generate",
@@ -866,6 +905,7 @@ async def call_sglang_generate(
                 "input_ids": prompt_ids,
                 "sampling_params": sp,
                 "return_logprob": True,
+                **({"top_logprobs_num": top_logprobs_num} if top_logprobs_num > 0 else {}),
             },
             headers=headers,
         ) as r:
@@ -885,6 +925,9 @@ async def call_sglang_generate(
         output_token_logprobs = meta.get("output_token_logprobs") or []
         output_ids = [x[1] for x in output_token_logprobs]
         output_log_probs = [float(x[0]) for x in output_token_logprobs]
+        # top-k alternative logprobs per position: list of [(logprob, token_id), ...]
+        # (None when SLIME_TOP_LOGPROBS not set / upstream didn't return them).
+        output_top_logprobs = meta.get("output_top_logprobs") or None
         finish = (meta.get("finish_reason") or {}).get("type", "stop") or "stop"
     except (asyncio.CancelledError, aiohttp.ClientError, asyncio.TimeoutError) as e:
         # free the sglang slot eagerly on client cancel/timeout, else the
@@ -902,7 +945,7 @@ async def call_sglang_generate(
         output_ids=output_ids,
         finish_reason=finish,
         output_log_probs=output_log_probs,
-    )
+    ), output_top_logprobs
 
 
 def _parse_messages_json(data: dict) -> tuple[str, str, int, list[dict]]:
