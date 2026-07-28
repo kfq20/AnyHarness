@@ -184,6 +184,9 @@ class BaseAdapter:
         # per-sid turn cap: return 429 to kill the run once exceeded
         self.max_turns_per_sid: int | None = max_turns_per_sid
         self._sid_turn_count: dict[str, int] = {}
+        # inbound auth headers (Authorization / x-api-key) captured per-turn in
+        # _run_turn and forwarded to the messages upstream so it can authenticate.
+        self._inbound_auth: dict[str, str] = {}
         # messages-mode only: the structured content blocks from the last upstream
         # response, so _run_turn can build a manager_message carrying tool_calls /
         # reasoning_content directly from Anthropic wire (parse_model_output can't
@@ -269,7 +272,7 @@ class BaseAdapter:
                 async with sess.post(
                     f"{upstream}/v1/messages",
                     json=fwd_body,
-                    headers={"Content-Type": "application/json"},
+                    headers={"Content-Type": "application/json", **self._inbound_auth},
                 ) as r:
                     if r.status >= 400:
                         detail = await r.text()
@@ -555,6 +558,15 @@ class BaseAdapter:
                 if tok is not None else []
             )
 
+            # Pass the inbound auth headers (Authorization / x-api-key) through to
+            # the messages upstream so the upstream can authenticate the request.
+            # In messages mode we forward the body verbatim, so the client's own
+            # credentials are the right ones to present upstream.
+            self._inbound_auth = {
+                k: v
+                for k, v in request.headers.items()
+                if k.lower() in ("authorization", "x-api-key", "x-goog-api-key", "anthropic-version")
+            }
             turn = await self._call_upstream(prompt_ids, s, body, sid)
 
             raw_output = (

@@ -225,6 +225,10 @@ async def run_once(cfg: Config, *, session_id: str | None = None) -> list:
         # stand-ins and reproducibility).
         os.environ["ADAPTER_AUTH"] = session_id
         os.environ["ADAPTER_URL"] = server.url
+        # The adapter (background thread) routes requests to the trajectory tree
+        # by session id; expose it so _request_session_id reads it instead of
+        # overloading the auth credential (which must be the real upstream key).
+        os.environ["SLIME_SESSION_ID"] = session_id
 
         harness = ClaudeCodeHarness(model=cfg.claude_model)
         sb = make_sandbox(cfg)

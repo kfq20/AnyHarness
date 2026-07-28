@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import secrets
 from typing import Any
 
@@ -289,8 +290,17 @@ def _build_reply_parts_from_blocks(
 
 
 def _request_session_id(request: web.Request) -> str:
-    # Anthropic auth lands in Authorization: Bearer or X-Api-Key; the Messages
-    # body carries no sid hint. Bearer wins when both are present.
+    """Resolve the session id for an inbound /v1/messages request.
+
+    The sid routes the request to its trajectory tree; it is NOT the upstream
+    API key (forwarding the sid upstream would 401). When the harness exports
+    SLIME_SESSION_ID, every request in the run carries it as a header so the
+    adapter can route without overloading the auth credential. Otherwise we
+    fall back to the Bearer / X-Api-Key (legacy, sid == token).
+    """
+    sid = os.environ.get("SLIME_SESSION_ID")
+    if sid:
+        return sid
     return sid_from_bearer(request) or (request.headers.get("X-Api-Key") or "").strip() or "default"
 
 

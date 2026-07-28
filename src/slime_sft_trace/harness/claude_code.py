@@ -210,19 +210,31 @@ class ClaudeCodeHarness:
         """Run claude-code to completion and return its exit code.
 
         Steps: (optional) write_config -> launch ``claude -p <prompt>`` with the
-        adapter as ANTHROPIC_BASE_URL and the session_id as ANTHROPIC_AUTH_TOKEN
-        -> wait within ``time_budget_sec``.
+        adapter as ANTHROPIC_BASE_URL -> wait within ``time_budget_sec``.
+
+        The adapter routes requests to their trajectory tree by session id, but
+        the id is NOT the upstream API key (forwarding it upstream would 401).
+        We pass the session id via SLIME_SESSION_ID (read by the adapter), and let
+        claude-code carry the real upstream credential from ANTHROPIC_AUTH_TOKEN /
+        ANTHROPIC_API_KEY so the adapter can forward it verbatim to the upstream.
         """
         await self.write_config(sb, workdir)
 
         claude_bin = os.environ.get(self.claude_bin_env, "claude")
         cmd = f"{shlex.quote(claude_bin)} -p {shlex.quote(prompt)} {self.launch_flags}"
+        # Carry the real upstream credential through to claude-code (it sends it
+        # as the Authorization header, which the adapter forwards to the upstream).
+        upstream_token = os.environ.get("ANTHROPIC_AUTH_TOKEN") or os.environ.get("ANTHROPIC_API_KEY")
         env = {
             "ANTHROPIC_BASE_URL": adapter_url,
-            "ANTHROPIC_AUTH_TOKEN": session_id,
             "ANTHROPIC_MODEL": self.model,
+            "SLIME_SESSION_ID": session_id,
             **self.static_env,
         }
+        if upstream_token:
+            # claude-code sends ANTHROPIC_AUTH_TOKEN as the Authorization: Bearer
+            # header; the adapter forwards it verbatim to the messages upstream.
+            env["ANTHROPIC_AUTH_TOKEN"] = upstream_token
 
         exit_code, out = await sb.exec(
             cmd, env=env, workdir=workdir, timeout=time_budget_sec
