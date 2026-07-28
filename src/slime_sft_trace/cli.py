@@ -47,8 +47,8 @@ class Config:
 
     def __init__(self) -> None:
         self.upstream_mode = os.environ.get("UPSTREAM_MODE", "sglang").strip().lower()
-        if self.upstream_mode not in ("sglang", "messages", "chat"):
-            raise ValueError(f"UPSTREAM_MODE must be 'sglang', 'messages', or 'chat', got {self.upstream_mode!r}")
+        if self.upstream_mode not in ("sglang", "messages", "chat", "responses"):
+            raise ValueError(f"UPSTREAM_MODE must be 'sglang', 'messages', 'chat', or 'responses', got {self.upstream_mode!r}")
 
         self.model_path = os.environ.get("MODEL_PATH") or None
         self.sglang_url = os.environ.get("SLIME_SGLANG_URL") or None
@@ -74,6 +74,9 @@ class Config:
         elif self.upstream_mode == "messages":
             if not self.messages_upstream_url:
                 raise ValueError("SLIME_MESSAGES_UPSTREAM_URL is required in messages mode")
+        elif self.upstream_mode == "responses":
+            if not os.environ.get("SLIME_RESPONSES_BASE_URL"):
+                raise ValueError("SLIME_RESPONSES_BASE_URL is required in responses mode")
         else:  # chat
             if not os.environ.get("SLIME_CHAT_BASE_URL"):
                 raise ValueError("SLIME_CHAT_BASE_URL is required in chat mode")
@@ -255,7 +258,7 @@ async def run_once(cfg: Config, *, session_id: str | None = None) -> list:
         # can pick based on their datasets version: glm52 needs datasets>=4.7
         # (or an explicit Json() Features schema); openai_wire loads on
         # datasets<4.7 which infers tool_calls.function.arguments as a string.
-        if cfg.upstream_mode in ("messages", "chat"):
+        if cfg.upstream_mode in ("messages", "chat", "responses"):
             from .dump import dump_samples_sft
 
             dump_samples_sft(samples, cfg.output_dir, flavor="glm52")

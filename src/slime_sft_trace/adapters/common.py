@@ -190,8 +190,8 @@ class BaseAdapter:
         # upstream backend: "sglang" (default) POSTs /generate with return_logprob;
         # "messages" forwards the raw /v1/messages body to an arbitrary messages API.
         mode = os.environ.get("UPSTREAM_MODE", "sglang").strip().lower() or "sglang"
-        if mode not in ("sglang", "messages", "chat"):
-            raise ValueError(f"UPSTREAM_MODE={mode!r} must be 'sglang', 'messages', or 'chat'")
+        if mode not in ("sglang", "messages", "chat", "responses"):
+            raise ValueError(f"UPSTREAM_MODE={mode!r} must be 'sglang', 'messages', 'chat', or 'responses'")
         self.upstream_mode = mode
         self.tool_parser = tool_parser
         self.reasoning_parser = reasoning_parser
@@ -269,6 +269,8 @@ class BaseAdapter:
             return turn
         if self.upstream_mode == "chat":
             return await self._call_chat_upstream(translated, tools_schema, body, session_id)
+        if self.upstream_mode == "responses":
+            return await self._call_responses_upstream(translated, tools_schema, body, session_id)
         # sglang: call_sglang_generate returns (TurnRecord, top_k_logprobs|None)
         turn, top_k = await call_sglang_generate(
             prompt_ids, session, body, adapter=self, session_id=session_id
@@ -480,6 +482,96 @@ class BaseAdapter:
         }.get(stop_reason, stop_reason or "stop")
         return TurnRecord(prompt_ids=[], output_ids=[], finish_reason=finish, output_log_probs=output_log_probs)
 
+    async def _call_responses_upstream(
+        self,
+        translated: list[dict],
+        tools_schema: list[dict] | None,
+        body: dict,
+        session_id: str | None,
+    ) -> TurnRecord:
+        """Route one turn through litellm.aresponses (OpenAI Responses API).
+
+        responses mode targets vLLM's /v1/responses endpoint (the only one that
+        implements logprobs on the Responses API — SGLang's is still TODO). The
+        chat-completions hub shape is adapted to the Responses API input format,
+        the response is re-shaped to Anthropic content blocks, and logprobs are
+        extracted from output_text.logprobs.
+
+        Env: ``SLIME_RESPONSES_BASE_URL``, ``SLIME_RESPONSES_API_KEY``,
+        ``SLIME_RESPONSES_MODEL``. ``SLIME_RESPONSES_LOGPROBS=1`` enables
+        ``include=["message.output_text.logprobs"]``;
+        ``SLIME_RESPONSES_TOP_LOGPROBS=N`` sets top-k.
+        """
+        import litellm
+
+        from slime_sft_trace.adapters.anthropic import responses_output_to_blocks
+
+        base_url = os.environ.get("SLIME_RESPONSES_BASE_URL") or ""
+        model = os.environ.get("SLIME_RESPONSES_MODEL") or "gpt-4o"
+        api_key = os.environ.get("SLIME_RESPONSES_API_KEY") or self._inbound_auth.get("authorization") or ""
+        if api_key.lower().startswith("bearer "):
+            api_key = api_key[7:]
+        if not base_url:
+            raise RuntimeError("UPSTREAM_MODE=responses requires SLIME_RESPONSES_BASE_URL")
+
+        # Responses API uses `input` (messages or string) instead of `messages`.
+        include = []
+        want_logprobs = os.environ.get("SLIME_RESPONSES_LOGPROBS") == "1"
+        if want_logprobs:
+            include.append("message.output_text.logprobs")
+        top_k = int(os.environ.get("SLIME_RESPONSES_TOP_LOGPROBS", "0") or "0")
+
+        kwargs: dict[str, Any] = {
+            "model": f"openai/{model}",
+            "input": translated,  # Responses API accepts chat messages as input
+            "api_base": base_url,
+            "api_key": api_key,
+            "stream": False,
+        }
+        if tools_schema:
+            kwargs["tools"] = tools_schema
+        if body.get("max_tokens"):
+            kwargs["max_output_tokens"] = int(body["max_tokens"])
+        if include:
+            kwargs["include"] = include
+        if top_k > 0:
+            kwargs["top_logprobs"] = top_k
+        extra = {k: v for k, v in self._inbound_auth.items() if k.lower() not in ("authorization",)}
+        if extra:
+            kwargs["extra_headers"] = extra
+
+        try:
+            response = await litellm.aresponses(**kwargs)
+        except Exception as exc:
+            self.logger.warning("[%s] sid=%s responses upstream failed: %s", self.log_prefix, session_id, exc)
+            raise
+
+        blocks, stop_reason = responses_output_to_blocks(response)
+        self._last_content_blocks = blocks
+
+        # extract logprobs from output_text.logprobs (if requested)
+        output_log_probs: list[float] = []
+        if want_logprobs:
+            try:
+                for item in getattr(response, "output", []) or []:
+                    for content in getattr(item, "content", []) or []:
+                        lp = getattr(content, "logprobs", None)
+                        if lp:
+                            for entry in lp:
+                                val = getattr(entry, "logprob", None)
+                                if val is not None:
+                                    output_log_probs.append(float(val))
+            except (AttributeError, TypeError):
+                pass
+
+        finish = {
+            "max_tokens": "length",
+            "end_turn": "stop",
+            "stop_sequence": "stop",
+            "tool_use": "tool_calls",
+        }.get(stop_reason, stop_reason or "stop")
+        return TurnRecord(prompt_ids=[], output_ids=[], finish_reason=finish, output_log_probs=output_log_probs)
+
     def _reply_from_content_blocks(
         self, blocks: list[dict], finish: str, tools_schema: list[dict] | None
     ) -> "Reply":
@@ -595,7 +687,7 @@ class BaseAdapter:
         # doing so, leaving nothing for a message-level fallback to read. So in
         # messages mode we branch to the message-level path BEFORE touching
         # get_trajectory; the token path below is unchanged for sglang mode.
-        if self.upstream_mode in ("messages", "chat"):
+        if self.upstream_mode in ("messages", "chat", "responses"):
             return self._finish_messages_session(
                 sid, base_sample=base_sample, reward=reward, extra_metadata=extra_metadata
             )
@@ -753,7 +845,7 @@ class BaseAdapter:
             # from those blocks so tool_calls + reasoning_content survive into the
             # trajectory (and thus the SFT dump). sglang mode has no blocks and
             # falls through to the parsed reply (unchanged).
-            if self.upstream_mode in ("messages", "chat") and self._last_content_blocks:
+            if self.upstream_mode in ("messages", "chat", "responses") and self._last_content_blocks:
                 reply = self._reply_from_content_blocks(self._last_content_blocks, turn.finish_reason, tools_schema)
                 self._last_content_blocks = []
             else:

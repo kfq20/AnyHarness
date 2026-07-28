@@ -410,6 +410,61 @@ def chat_response_to_blocks(response: Any) -> tuple[list[dict], str]:
     return blocks, stop_reason
 
 
+def responses_output_to_blocks(response: Any) -> tuple[list[dict], str]:
+    """Convert an OpenAI Responses API response to Anthropic content blocks.
+
+    Responses mode targets vLLM's /v1/responses (the only Responses impl with
+    logprobs). The response has ``output`` (list of ResponseOutputItem), each with
+    ``content`` (list of output parts). We extract text + tool calls into the
+    Anthropic block shape the messages-mode reply path expects.
+
+    Returns ``(blocks, stop_reason)``.
+    """
+    blocks: list[dict] = []
+    has_tool_use = False
+    status = getattr(response, "status", "completed")
+
+    for item in getattr(response, "output", []) or []:
+        item_type = getattr(item, "type", None)
+        # message item: {role, content:[{type:output_text, text}, {type:function_call, ...}]}
+        content = getattr(item, "content", []) or []
+        for part in content:
+            if not isinstance(part, dict) and not hasattr(part, "type"):
+                continue
+            pt = getattr(part, "type", None) if not isinstance(part, dict) else part.get("type")
+            if pt == "output_text":
+                text = getattr(part, "text", None) if not isinstance(part, dict) else part.get("text")
+                if text:
+                    blocks.append({"type": "text", "text": text})
+            elif pt == "function_call":
+                has_tool_use = True
+                name = getattr(part, "name", None) if not isinstance(part, dict) else part.get("name")
+                args = getattr(part, "arguments", None) if not isinstance(part, dict) else part.get("arguments")
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args) if args else {}
+                    except (ValueError, TypeError):
+                        args = {"_raw": args}
+                call_id = getattr(part, "call_id", None) or getattr(part, "id", None) if not isinstance(part, dict) else part.get("call_id") or part.get("id")
+                blocks.append({"type": "tool_use", "id": call_id or "", "name": name or "tool", "input": args if isinstance(args, dict) else {}})
+            elif pt == "reasoning":
+                # reasoning content (vLLM may expose it)
+                summary = getattr(part, "summary", None) if not isinstance(part, dict) else part.get("summary")
+                if summary:
+                    blocks.append({"type": "thinking", "thinking": str(summary)})
+
+    if not blocks:
+        blocks.append({"type": "text", "text": ""})
+
+    if has_tool_use:
+        stop_reason = "tool_use"
+    elif status in ("incomplete", "failed"):
+        stop_reason = "max_tokens"
+    else:
+        stop_reason = "end_turn"
+    return blocks, stop_reason
+
+
 # --- Request framing: session id + wire response/stream rendering ---
 
 
