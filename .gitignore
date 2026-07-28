@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.venv/
+venv/
+
+# dump outputs (generated at runtime)
+/trajectories/
+*.jsonl
+!tests/**/*.jsonl
+
+# vendored slime reference (not part of the package)
+/vendor_slime_ref/
+
+# throwaway repro/probe scripts (dev-only)
+/repro_*.py
+/probe_*.py
+
+.env
