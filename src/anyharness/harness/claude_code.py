@@ -177,13 +177,23 @@ class ClaudeCodeHarness:
         self.model = model or os.environ.get("CLAUDE_MODEL", "slime-actor")
 
     async def write_config(self, sb: Sandbox, workdir: str) -> None:
-        """Pre-ack bypass-permissions so claude-code starts headless.
+        """Install the claude CLI (if missing) + pre-ack bypass-permissions.
 
-        Writes ~/.claude.json + ~/.claude/settings.json with
-        hasCompletedOnboarding + bypassPermissionsModeAccepted. Optional: if it
-        fails (e.g. read-only home) the run continues — claude can still run
-        with --permission-mode bypassPermissions in most setups.
+        The default e2b image has node but not claude-code; install it globally
+        (needs sudo on the non-root default user). Then write ~/.claude.json +
+        ~/.claude/settings.json with hasCompletedOnboarding +
+        bypassPermissionsModeAccepted so claude-code starts headless.
         """
+        # Install the CLI if it isn't on PATH yet (idempotent: skip if present).
+        try:
+            await sb.exec(
+                "command -v claude >/dev/null 2>&1 || "
+                "sudo npm install -g @anthropic-ai/claude-code >/tmp/cc_install.log 2>&1; "
+                "echo INSTALL_RC=$?",
+                timeout=180,
+            )
+        except Exception:
+            logger.warning("claude-code install step failed (continuing)")
         settings = json.dumps({"hasCompletedOnboarding": True, "bypassPermissionsModeAccepted": True})
         home = os.environ.get("HOME", "/root")
         try:

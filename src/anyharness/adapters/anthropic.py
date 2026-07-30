@@ -72,6 +72,16 @@ class AnthropicAdapter(BaseAdapter):
 
     def _preprocess_body(self, body: dict) -> None:
         _fold_mid_list_system_into_user(body)
+        # Claude Code >=2.1.197 emits cache_control objects carrying a nested
+        # "scope" field. Bedrock gateways reject it (400 "Extra inputs are not
+        # permitted"). Strip the sub-field but keep cache_control itself, so
+        # prompt caching still works. Walks system + message content blocks.
+        _strip_cache_control_scope(body)
+        # Claude Code >=2.1.197 sends a top-level context_management field
+        # (clear_thinking_20251015 edits). Bedrock gateways reject unknown
+        # fields with 400 "Extra inputs are not permitted". CC does not require
+        # it for correctness; strip it so the upstream accepts the request.
+        body.pop("context_management", None)
 
     def _translate(self, body: dict) -> tuple[list[dict], list[dict] | None]:
         translated = _translate_messages(body.get("messages") or [], body.get("system"))
@@ -1099,3 +1109,22 @@ def _fold_mid_list_system_into_user(body_obj: dict) -> bool:
     if changed:
         body_obj["messages"] = [m for m in msgs if m is not TOMBSTONE]
     return changed
+
+
+def _strip_cache_control_scope(node: Any) -> None:
+    """Recursively delete the "scope" sub-field from every cache_control object.
+
+    Claude Code >=2.1.197 emits cache_control{"type":"ephemeral","scope":{...}};
+    Bedrock-backed gateways reject the scope sub-field (400). Walks the request
+    body (system blocks + message content blocks) and strips scope in place,
+    keeping cache_control itself so prompt caching still works.
+    """
+    if isinstance(node, dict):
+        cc = node.get("cache_control")
+        if isinstance(cc, dict) and "scope" in cc:
+            del cc["scope"]
+        for v in node.values():
+            _strip_cache_control_scope(v)
+    elif isinstance(node, list):
+        for item in node:
+            _strip_cache_control_scope(item)

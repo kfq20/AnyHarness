@@ -29,8 +29,16 @@ from aiohttp import web
 from anyharness.parsing import parse_model_output
 from anyharness.trajectory import MASK_LOGPROB, TopkLogprobs, TrajectoryManager, TurnRecord
 
-
 __all__ = ["TurnRecord"]
+
+# anthropic-beta flags Claude Code sends that Bedrock-backed gateways (lsai)
+# reject wholesale (one bad flag -> 400 for the whole request). Measured
+# 2026-07-30; the other flags CC sends are accepted. Add entries as new 400s
+# surface against a given upstream.
+_BETA_DENYLIST: set[str] = {
+    "prompt-caching-scope-2026-01-05",
+    "advanced-tool-use-2025-11-20",
+}
 
 
 @dataclasses.dataclass
@@ -866,6 +874,17 @@ class BaseAdapter:
         else:
             fwd_body = self._anthropic_body_from_hub(body, translated, tools_schema)
         fwd_body["stream"] = want_stream
+        # Inject thinking.display=summarized: Bedrock-backed gateways (lsai)
+        # default to "omitted", which returns the thinking block with a signature
+        # but an EMPTY plaintext (the reasoning text is dropped). CC asks for
+        # adaptive thinking but does not set display, so we override it here so
+        # the plaintext reasoning_content is actually captured. Mirrors
+        # cc_log_proxy's -thinking-display summarized.
+        thinking = fwd_body.get("thinking")
+        if isinstance(thinking, dict):
+            thinking["display"] = "summarized"
+        elif fwd_body.get("thinking") is None and isinstance(fwd_body.get("messages"), list):
+            fwd_body["thinking"] = {"type": "adaptive", "display": "summarized"}
         timeout = aiohttp.ClientTimeout(total=None, sock_read=900)
         finish_reason = "stop"
         text = ""
@@ -1803,6 +1822,15 @@ class BaseAdapter:
                 for k, v in request.headers.items()
                 if k.lower() in ("authorization", "x-api-key", "x-goog-api-key", "anthropic-version")
             }
+            # Capture and sanitize anthropic-beta: Claude Code sends flags the
+            # upstream gateway rejects wholesale (one bad flag -> 400 for the
+            # whole request). Forward only accepted flags; drop the denylist.
+            beta = request.headers.get("anthropic-beta")
+            if beta:
+                kept = [f.strip() for f in beta.split(",")
+                        if f.strip() and f.strip() not in _BETA_DENYLIST]
+                if kept:
+                    self._inbound_auth["anthropic-beta"] = ",".join(kept)
             # messages-mode forwards the body verbatim, which is only valid when the
             # downstream body is already Anthropic-shaped. Record the inbound wire
             # format so _call_messages_upstream can translate when it is not.

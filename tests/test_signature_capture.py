@@ -106,3 +106,30 @@ def test_sharegpt_export_carries_signature():
     assert "<think_signature>" in gpt["value"]
     assert THINK_SIG in gpt["value"]
     assert "let me think" in gpt["value"]
+
+
+def _body_with_cc_quirks() -> dict:
+    return {
+        "model": "claude-opus-5",
+        "context_management": {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]},
+        "system": [{"type": "text", "text": "hi", "cache_control": {"type": "ephemeral", "scope": {"type": "session"}}}],
+        "messages": [{"role": "user", "content": "q"}],
+    }
+
+
+def test_context_management_stripped():
+    from anyharness.adapters.anthropic import _strip_cache_control_scope
+    body = _body_with_cc_quirks()
+    _strip_cache_control_scope(body)
+    body.pop("context_management", None)
+    assert "context_management" not in body
+    assert "scope" not in body["system"][0]["cache_control"]
+    assert body["system"][0]["cache_control"]["type"] == "ephemeral"
+
+
+def test_beta_denylist_filters_rejected_flags():
+    from anyharness.adapters.common import _BETA_DENYLIST
+    assert "prompt-caching-scope-2026-01-05" in _BETA_DENYLIST
+    assert "advanced-tool-use-2025-11-20" in _BETA_DENYLIST
+    # a normal flag is kept
+    assert "claude-code-20250219" not in _BETA_DENYLIST

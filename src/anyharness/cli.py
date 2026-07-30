@@ -260,9 +260,11 @@ def build_adapter(cfg: Config, tokenizer: Any) -> Any:
     )
 
 
-def make_sandbox(cfg: Config):
+async def make_sandbox(cfg: Config):
     if cfg.sandbox == "e2b":
-        return E2BSandbox()
+        from e2b_code_interpreter import AsyncSandbox
+        sbx = await AsyncSandbox.create(timeout=cfg.time_budget_sec + 300)
+        return E2BSandbox(sbx)
     return LocalSandbox()
 
 
@@ -279,9 +281,15 @@ async def run_once(cfg: Config, *, session_id: str | None = None) -> list:
     tokenizer = load_tokenizer(cfg)
     adapter = build_adapter(cfg, tokenizer)
 
-    server = AdapterServer(adapter, cfg.adapter_port)
+    # For e2b (SANDBOX=e2b): CC runs remotely and cannot reach 127.0.0.1. Bind the
+    # adapter to 0.0.0.0 and tell CC to use the host's public IP via the port.
+    # PUBLIC_ADAPTER_HOST overrides the host CC connects to (defaults to 127.0.0.1
+    # for local sandboxes). Set it to the machine's public IP for e2b.
+    public_host = os.environ.get("PUBLIC_ADAPTER_HOST", "127.0.0.1")
+    server = AdapterServer(adapter, cfg.adapter_port, host="0.0.0.0")
+    server._public_url = f"http://{public_host}:{cfg.adapter_port}"
     server.start()
-    logger.info("adapter serving at %s", server.url)
+    logger.info("adapter serving at %s (CC connects via %s)", server.url, getattr(server, "_public_url", server.url))
 
     try:
         session_id = session_id or secrets.token_hex(8)
@@ -298,12 +306,14 @@ async def run_once(cfg: Config, *, session_id: str | None = None) -> list:
         os.environ["SLIME_SESSION_ID"] = session_id
 
         harness = ClaudeCodeHarness(model=cfg.claude_model)
-        sb = make_sandbox(cfg)
+        sb = await make_sandbox(cfg)
+        # e2b has no host workdir; CC runs in /home/user. LocalSandbox keeps cwd.
+        workdir = "/home/user" if cfg.sandbox == "e2b" else os.getcwd()
         exit_code = await harness.run(
             sb,
-            workdir=os.getcwd(),
+            workdir=workdir,
             session_id=session_id,
-            adapter_url=server.url,
+            adapter_url=getattr(server, "_public_url", server.url),
             prompt=cfg.prompt,
             time_budget_sec=cfg.time_budget_sec,
         )
