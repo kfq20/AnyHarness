@@ -19,3 +19,6 @@ venv/
 /probe_*.py
 
 .env
+
+# openspec: spec-driven planning artifacts are local-only (changes + main specs)
+openspec/
