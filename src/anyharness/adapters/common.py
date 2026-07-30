@@ -73,6 +73,10 @@ class SamplingResult:
     turn: TurnRecord
     content_blocks: list[dict] | None = None
     top_logprobs: list | None = None
+    # Upstream-reported token counts (None = token-level backend, or upstream
+    # omitted usage; caller falls back to len(prompt_ids)/len(turn.output_ids)).
+    # Keys: input_tokens, output_tokens.
+    usage: dict | None = None
 
 
 @runtime_checkable
@@ -118,10 +122,11 @@ class MessagesUpstream(_DelegatingUpstream):
     message_level = True
 
     async def sample(self, messages, tools_schema, body, session, session_id):
+        self._a._last_usage = None  # reset per turn
         turn, blocks = await self._a._call_messages_upstream(
             body, session_id, translated=messages, tools_schema=tools_schema
         )
-        return SamplingResult(turn=turn, content_blocks=blocks)
+        return SamplingResult(turn=turn, content_blocks=blocks, usage=self._a._last_usage)
 
 
 class ChatUpstream(_DelegatingUpstream):
@@ -131,8 +136,10 @@ class ChatUpstream(_DelegatingUpstream):
     message_level = True
 
     async def sample(self, messages, tools_schema, body, session, session_id):
+        self._a._last_usage = None
         turn = await self._a._call_chat_upstream(messages, tools_schema, body, session_id)
-        return SamplingResult(turn=turn, content_blocks=self._a._last_content_blocks)
+        return SamplingResult(turn=turn, content_blocks=self._a._last_content_blocks,
+                               usage=self._a._last_usage)
 
 
 class ResponsesUpstream(_DelegatingUpstream):
@@ -142,8 +149,10 @@ class ResponsesUpstream(_DelegatingUpstream):
     message_level = True
 
     async def sample(self, messages, tools_schema, body, session, session_id):
+        self._a._last_usage = None
         turn = await self._a._call_responses_upstream(messages, tools_schema, body, session_id)
-        return SamplingResult(turn=turn, content_blocks=self._a._last_content_blocks)
+        return SamplingResult(turn=turn, content_blocks=self._a._last_content_blocks,
+                               usage=self._a._last_usage)
 
 
 class SglangUpstream(_DelegatingUpstream):
@@ -409,6 +418,9 @@ class BaseAdapter:
         self._last_content_blocks: list[dict] = []
         # sglang-only: per-turn top-k alternative logprobs (from output_top_logprobs)
         self._last_top_logprobs: list | None = None
+        # message-level upstreams: the upstream's own usage, surfaced onto
+        # SamplingResult.usage so _run_turn reports truthful token counts.
+        self._last_usage: dict | None = None
 
         self.app.router.add_get("/healthz", _health)
         self.app.router.add_get("/v1/models", _health)
@@ -649,6 +661,11 @@ class BaseAdapter:
                 logger.debug("[%s] sid=%s tokenizer.encode failed; output_ids empty", self.log_prefix, session_id)
                 output_ids = []
 
+        # Stash the upstream's own usage for MessagesUpstream.sample to surface onto
+        # SamplingResult (input_tokens isn't parsed by _parse_messages_json yet, so
+        # only output_tokens is truthful here; input falls back to local render).
+        if usage_out:
+            self._last_usage = {"output_tokens": int(usage_out), "input_tokens": None}
         return TurnRecord(
             prompt_ids=[],
             output_ids=output_ids,
@@ -837,6 +854,15 @@ class BaseAdapter:
 
         blocks, stop_reason = chat_response_to_blocks(response)
         self._last_content_blocks = blocks
+        # Surface the upstream's own usage (litellm ModelResponse.usage) so
+        # SamplingResult.usage reports truthful prompt/completion token counts
+        # instead of len(local render)/0.
+        u = getattr(response, "usage", None)
+        if u is not None:
+            self._last_usage = {
+                "input_tokens": getattr(u, "prompt_tokens", None),
+                "output_tokens": getattr(u, "completion_tokens", None),
+            }
 
         # Extract per-token logprobs from the chat response (OpenAI shape:
         # choices[0].logprobs.content = [{token, logprob, top_logprobs:[...]}]).
@@ -1044,6 +1070,17 @@ class BaseAdapter:
 
         blocks, stop_reason = responses_output_to_blocks(response)
         self._last_content_blocks = blocks
+        # Surface the upstream's own usage (Responses API usage: input_tokens/
+        # output_tokens). Works for both the litellm pydantic response and the
+        # _AttrView fallback (getattr falls through to the parsed dict).
+        u = getattr(response, "usage", None)
+        if u is not None:
+            self._last_usage = {
+                "input_tokens": getattr(u, "input_tokens", None)
+                if not isinstance(u, dict) else u.get("input_tokens"),
+                "output_tokens": getattr(u, "output_tokens", None)
+                if not isinstance(u, dict) else u.get("output_tokens"),
+            }
 
         # extract logprobs from output_text.logprobs (if requested)
         output_log_probs: list[float] = []
@@ -1422,7 +1459,14 @@ class BaseAdapter:
                 reply = self._build_reply(parsed, turn.finish_reason, translated, tools_schema)
             turn = dataclasses.replace(turn, ill_formed=parsed.ill_formed)
 
-            in_tok, out_tok = len(prompt_ids), len(turn.output_ids)
+            # Truthful usage: message-level backends report the upstream's own token counts
+            # (server-rendered). Token-level backends (sglang/tinker) leave usage None
+            # and fall back to the locally-rendered prompt_ids / output_ids length.
+            if result.usage:
+                in_tok = int(result.usage.get("input_tokens") or len(prompt_ids))
+                out_tok = int(result.usage.get("output_tokens") or len(turn.output_ids))
+            else:
+                in_tok, out_tok = len(prompt_ids), len(turn.output_ids)
             stream = body.get("stream") is True or "text/event-stream" in request.headers.get("Accept", "")
 
             # Flush the response before recording the trajectory: a client that
