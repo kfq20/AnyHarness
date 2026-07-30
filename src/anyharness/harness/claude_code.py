@@ -173,8 +173,33 @@ class ClaudeCodeHarness:
     # (default "claude") if it lives elsewhere.
     claude_bin_env = "CLAUDE_BIN"
 
-    def __init__(self, *, model: str | None = None) -> None:
+    def __init__(self, *, model: str | None = None,
+                 launch_flags: str | None = None,
+                 write_config: bool = True) -> None:
+        """Configure the claude-code launch.
+
+        Parameters
+        ----------
+        model:
+            Model id passed to claude via ``ANTHROPIC_MODEL``. Defaults to the
+            ``CLAUDE_MODEL`` env var or ``"slime-actor"``.
+        launch_flags:
+            Override the flags appended to ``claude -p <prompt>``. The default
+            uses ``--permission-mode bypassPermissions`` (headless, no prompts),
+            which requires a sandbox where disarming permissions is safe. In
+            environments where bypass is unavailable or undesirable (e.g. a
+            locked root host, local dev, CI that forbids bypass), pass an
+            alternative such as ``"--output-format stream-json --verbose"``
+            combined with a ``--settings <file>`` (acceptEdits) path. The flags
+            must still emit ``stream-json`` for trajectory capture.
+        write_config:
+            Whether to pre-ack bypass-permissions via :meth:`write_config`.
+            Leave ``True`` with the default ``launch_flags``. Set ``False`` when
+            using a non-bypass launch (the bypass pre-ack is then irrelevant).
+        """
         self.model = model or os.environ.get("CLAUDE_MODEL", "slime-actor")
+        self._launch_flags = launch_flags if launch_flags is not None else self.launch_flags
+        self._write_config = write_config
 
     async def write_config(self, sb: Sandbox, workdir: str) -> None:
         """Pre-ack bypass-permissions so claude-code starts headless.
@@ -217,11 +242,21 @@ class ClaudeCodeHarness:
         We pass the session id via SLIME_SESSION_ID (read by the adapter), and let
         claude-code carry the real upstream credential from ANTHROPIC_AUTH_TOKEN /
         ANTHROPIC_API_KEY so the adapter can forward it verbatim to the upstream.
+
+        When ``launch_flags`` omits ``--permission-mode bypassPermissions`` (or
+        ``write_config=False``), the bypass pre-ack is skipped. The caller is
+        then responsible for headless execution — typically by including a
+        ``--settings <file>`` with ``defaultMode: acceptEdits`` in
+        ``launch_flags`` (and, if a global ``~/.claude/settings.json`` overrides
+        ``env`` keys like ``ANTHROPIC_BASE_URL``, embedding the adapter URL + auth
+        token in that settings file's ``env`` block, since claude-code's
+        ``--settings`` wins over the ambient environment and global settings).
         """
-        await self.write_config(sb, workdir)
+        if self._write_config:
+            await self.write_config(sb, workdir)
 
         claude_bin = os.environ.get(self.claude_bin_env, "claude")
-        cmd = f"{shlex.quote(claude_bin)} -p {shlex.quote(prompt)} {self.launch_flags}"
+        cmd = f"{shlex.quote(claude_bin)} -p {shlex.quote(prompt)} {self._launch_flags}"
         # Carry the real upstream credential through to claude-code (it sends it
         # as the Authorization header, which the adapter forwards to the upstream).
         upstream_token = os.environ.get("ANTHROPIC_AUTH_TOKEN") or os.environ.get("ANTHROPIC_API_KEY")
