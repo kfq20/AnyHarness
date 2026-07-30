@@ -27,7 +27,7 @@ import aiohttp
 from aiohttp import web
 
 from anyharness.parsing import parse_model_output
-from anyharness.trajectory import TrajectoryManager, TurnRecord
+from anyharness.trajectory import MASK_LOGPROB, TopkLogprobs, TrajectoryManager, TurnRecord
 
 
 __all__ = ["TurnRecord"]
@@ -99,6 +99,37 @@ class SamplingUpstream(Protocol):
         session: "Session",
         session_id: str | None,
     ) -> SamplingResult: ...
+
+
+def _sglang_topk_to_typed(
+    raw: list | None, k: int
+) -> TopkLogprobs | None:
+    """Convert sglang ``output_top_logprobs`` to a sentinel-padded TopkLogprobs.
+
+    sglang returns ``list[list[(logprob, token_id)]]`` — per position, up to k
+    alternatives (fewer when the position had fewer candidates). We split into
+    paired dense arrays and pad short positions with ``(0, MASK_LOGPROB)`` so the
+    pair is rectangular ``(num_tokens, k)`` — the Tinker SDK TopkPromptLogprobs
+    convention. None when the upstream returned no top-k.
+    """
+    if not raw:
+        return None
+    token_ids: list[list[int]] = []
+    logprobs: list[list[float]] = []
+    for position in raw:
+        if not position:
+            token_ids.append([0] * k)
+            logprobs.append([MASK_LOGPROB] * k)
+            continue
+        ids = [int(tid) for _, tid in position]
+        lps = [float(lp) for lp, _ in position]
+        if len(ids) < k:
+            pad = k - len(ids)
+            ids += [0] * pad
+            lps += [MASK_LOGPROB] * pad
+        token_ids.append(ids)
+        logprobs.append(lps)
+    return TopkLogprobs(token_ids=token_ids, logprobs=logprobs)
 
 
 class _DelegatingUpstream:
@@ -174,7 +205,8 @@ class SglangUpstream(_DelegatingUpstream):
         turn, top_k = await call_sglang_generate(
             prompt_ids, session, body, adapter=self._a, session_id=session_id
         )
-        return SamplingResult(turn=turn, top_logprobs=top_k)
+        k = int(os.environ.get("SLIME_TOP_LOGPROBS", "0") or "0") or None
+        return SamplingResult(turn=turn, top_logprobs=_sglang_topk_to_typed(top_k, k or 0))
 
 
 class TinkerUpstream(_DelegatingUpstream):

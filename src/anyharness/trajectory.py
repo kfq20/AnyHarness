@@ -13,11 +13,71 @@ import dataclasses
 import enum
 import logging
 from collections.abc import Iterator
-from typing import Any
+from typing import Any, Literal
 
 from .types import Sample
 
 logger = logging.getLogger(__name__)
+
+# Canonical stop reason on the capture-layer result, matching the Tinker SDK
+# StopReason = Literal["length", "stop"]. Each upstream maps its wire vocabulary
+# to one of these at the result boundary (capture-only; wire rendering keeps its
+# own format-specific finish strings).
+StopReason = Literal["length", "stop"]
+
+_LENGTH_WIRE = {"length", "max_tokens", "abort"}
+
+
+def to_stop_reason(wire: str) -> StopReason:
+    """Map an upstream's wire finish-reason to the canonical StopReason.
+
+    max_tokens / length / abort -> "length" (budget exhausted); everything else
+    (stop / end_turn / tool_calls / stop_sequence) -> "stop" (a tool call is a
+    normal stop from the sampling perspective).
+    """
+    if wire in _LENGTH_WIRE:
+        return "length"
+    return "stop"
+
+
+# Tinker SDK convention: sentinel for an absent top-k alternative (a dense
+# array can't hold None in a cell, so positions with fewer-than-k alternatives
+# are padded). token_id 0 + this logprob value mark a padded cell.
+MASK_LOGPROB = -99999.0
+_MASK_TOKEN_ID = 0
+
+
+@dataclasses.dataclass(frozen=True)
+class TopkLogprobs:
+    """Per-position top-k alternative logprobs as a dense pair of rectangular
+    arrays, shape ``(num_tokens, k)``. Padded with ``(0, MASK_LOGPROB)`` where the
+    upstream returned fewer than k alternatives. Mirrors the Tinker SDK
+    ``TopkPromptLogprobs`` (list-based, not numpy, to keep AnyHarness zero-dep)."""
+
+    token_ids: list[list[int]]
+    logprobs: list[list[float]]
+
+
+@dataclasses.dataclass(frozen=True)
+class SampledSequence:
+    """One generated sequence: structurally paired tokens and logprobs.
+
+    When ``logprobs`` is not None, ``len(logprobs) == len(tokens)`` is an
+    invariant enforced at construction — a misaligned backend fails here, at the
+    upstream boundary, rather than tripping a downstream assert in record_turn.
+    Mirrors the Tinker SDK ``SampledSequence`` (list-based).
+    """
+
+    tokens: list[int]
+    logprobs: list[float] | None = None
+    stop_reason: StopReason = "stop"
+
+    def __post_init__(self) -> None:
+        if self.logprobs is not None and len(self.logprobs) != len(self.tokens):
+            raise ValueError(
+                f"SampledSequence: logprobs length {len(self.logprobs)} != "
+                f"tokens length {len(self.tokens)}"
+            )
 
 
 # ===========================================================================
@@ -27,15 +87,47 @@ logger = logging.getLogger(__name__)
 
 @dataclasses.dataclass(frozen=True)
 class TurnRecord:
-    """One sglang ``/generate`` snapshot: the contract between an adapter and the
-    manager. Adapters build it from a turn's prompt/output token ids; ``record_turn``
-    consumes it."""
+    """One upstream turn: the contract between an adapter and the manager.
+
+    Constructed from the legacy flat fields (prompt_ids / output_ids /
+    output_log_probs / finish_reason); ``__post_init__`` derives a
+    :class:`SampledSequence` (structurally-paired tokens+logprobs, typed
+    StopReason) so consumers may read either the flat fields (compat) or
+    ``turn.sequence`` (preferred). The logprob-length invariant is enforced
+    when the sequence is built — a misaligned backend fails here, at the
+    upstream boundary, not in record_turn.
+    """
 
     prompt_ids: list[int]
     output_ids: list[int]
     finish_reason: str
     output_log_probs: list[float] = dataclasses.field(default_factory=list)
     ill_formed: bool = False
+    # Derived; not part of the constructor signature. Set in __post_init__.
+    sequence: SampledSequence = dataclasses.field(init=False, default=None, repr=False)  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "sequence",
+            SampledSequence(
+                tokens=list(self.output_ids),
+                logprobs=list(self.output_log_probs) if self.output_log_probs else None,
+                stop_reason=to_stop_reason(self.finish_reason),
+            ),
+        )
+
+    @classmethod
+    def from_sequence(cls, prompt_ids: list[int], sequence: SampledSequence,
+                      ill_formed: bool = False) -> "TurnRecord":
+        """Build directly from a SampledSequence (no wire finish_reason mapping)."""
+        return cls(
+            prompt_ids=list(prompt_ids),
+            output_ids=list(sequence.tokens),
+            finish_reason=sequence.stop_reason,
+            output_log_probs=list(sequence.logprobs) if sequence.logprobs else [],
+            ill_formed=ill_formed,
+        )
 
 
 # ===========================================================================
