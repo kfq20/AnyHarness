@@ -388,7 +388,7 @@ def _translate_messages(msgs: list[dict], system: Any) -> list[dict]:
                 else:
                     translated.append({"role": "user", "content": flatten_content(b)})
         elif role == "assistant":
-            texts, thinkings, tcs = [], [], []
+            texts, thinkings, sigs, tcs = [], [], [], []
             blocks = content if isinstance(content, list) else [{"type": "text", "text": flatten_content(content)}]
             for b in blocks:
                 if not isinstance(b, dict):
@@ -397,12 +397,20 @@ def _translate_messages(msgs: list[dict], system: Any) -> list[dict]:
                     texts.append(b.get("text", ""))
                 elif b.get("type") == "thinking":
                     thinkings.append(b.get("thinking", ""))
+                    sig = b.get("signature")
+                    if sig:
+                        sigs.append(sig)
                 elif b.get("type") == "tool_use":
                     # drop the wire-only id; tool_call_dict keeps arguments a dict
                     tcs.append(tool_call_dict(b.get("name", "tool"), b.get("input")))
             mo: dict[str, Any] = {"role": "assistant", "content": "".join(texts)}
             if thinkings:
                 mo["reasoning_content"] = "".join(thinkings)
+            if sigs:
+                # carry the signature so this replayed echo compares equal (dict
+                # equality) to the generated leaf, which also stores it --
+                # otherwise the tree forks on every thinking turn.
+                mo["thinking_signature"] = "".join(sigs)
             if tcs:
                 mo["tool_calls"] = tcs
             translated.append(mo)
@@ -610,6 +618,7 @@ def _build_reply_parts_from_blocks(
     """
     text_parts: list[str] = []
     reasoning_parts: list[str] = []
+    signature_parts: list[str] = []   # extended-thinking provenance signatures
     manager_tcs: list[dict] = []
     has_tool_use = False
     for b in blocks:
@@ -621,6 +630,9 @@ def _build_reply_parts_from_blocks(
         elif bt in ("thinking", "reasoning", "analysis"):
             # production converter treats reasoning/analysis as thinking too
             reasoning_parts.append(b.get("thinking") or b.get("reasoning") or b.get("analysis") or "")
+            sig = b.get("signature")
+            if sig:
+                signature_parts.append(sig)
         elif bt == "tool_use":
             has_tool_use = True
             manager_tcs.append(tool_call_dict(b.get("name", "tool"), b.get("input")))
@@ -639,6 +651,11 @@ def _build_reply_parts_from_blocks(
     manager_message: dict[str, Any] = {"role": "assistant", "content": "".join(t for t in text_parts if t)}
     if reasoning_parts:
         manager_message["reasoning_content"] = "".join(reasoning_parts)
+    if signature_parts:
+        # thinking_signature: the extended-thinking provenance token. Joined
+        # in block order to match how the trace presents thinking; downstream
+        # (ShareGPT export / SFT) carries it as a provenance field.
+        manager_message["thinking_signature"] = "".join(signature_parts)
     if manager_tcs:
         manager_message["tool_calls"] = manager_tcs
     if has_tool_use:
