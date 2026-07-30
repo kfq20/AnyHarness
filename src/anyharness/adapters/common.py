@@ -1949,6 +1949,13 @@ async def _consume_messages_sse(response: aiohttp.ClientResponse) -> tuple[str, 
             elif dt == "thinking_delta":
                 if idx in blocks:
                     blocks[idx]["thinking"] = blocks[idx].get("thinking", "") + delta.get("thinking", "")
+            elif dt == "signature_delta":
+                # Anthropic extended-thinking signature (cryptographic provenance
+                # for the thinking block). Accumulate onto the thinking block so it
+                # survives into the trajectory — without this the signature is
+                # silently dropped and the trace loses its provenance token.
+                if idx in blocks:
+                    blocks[idx]["signature"] = blocks[idx].get("signature", "") + delta.get("signature", "")
         elif etype == "content_block_stop":
             idx = evt.get("index", 0)
             if idx in blocks and "_input_json" in blocks[idx]:
