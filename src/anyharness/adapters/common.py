@@ -244,6 +244,106 @@ class TinkerUpstream(_DelegatingUpstream):
         return SamplingResult(turn=turn)
 
 
+class CompletionsUpstream(_DelegatingUpstream):
+    """``UPSTREAM_MODE=completions``: vLLM (or sglang's OpenAI-serve) ``/v1/completions``.
+
+    A text-completion endpoint that is natively token-in/token-out: the prompt is
+    passed as a token-id array (the server uses our ids verbatim — input-side
+    TITO) and ``choice.token_ids`` + ``logprobs.token_logprobs`` come back paired
+    from one response (output-side TITO, no separate re-issue like the chat path
+    needs). Structurally parallel to :class:`SglangUpstream` — it routes through
+    the token-level ``parse_model_output`` → ``_build_reply`` pipeline, avoiding
+    the chat upstream's messages+tools-shape workarounds entirely.
+    """
+
+    message_level = False
+
+    async def sample(self, messages, tools_schema, body, session, session_id):
+        # Same render path as sglang: the server's /tokenize renders the chat
+        # template itself (TITO-safe: ids from the server, not re-encoded text),
+        # falling back to local render. The completions endpoint then takes
+        # these ids as a raw `prompt` array.
+        prompt_ids = await self._a._tokenize_messages_server(
+            self._a._completions_url(), messages, tools_schema, session_id
+        )
+        if not prompt_ids:
+            prompt_ids = self._a._render_prompt_for(messages, tools_schema)
+        turn, top_k = await call_completions(
+            prompt_ids, session, body, adapter=self._a, session_id=session_id
+        )
+        k = int(os.environ.get("SLIME_COMPLETIONS_TOP_LOGPROBS", "0") or "0") or None
+        return SamplingResult(
+            turn=turn,
+            top_logprobs=_completions_topk_to_typed(top_k, k or 0, self._a.tokenizer),
+        )
+
+
+def _completions_topk_to_typed(
+    raw: list | None, k: int, tokenizer
+) -> TopkLogprobs | None:
+    """Convert vLLM completions ``top_logprobs`` to a sentinel-padded TopkLogprobs.
+
+    vLLM ``/v1/completions`` returns ``choice.logprobs.top_logprobs`` as a
+    ``list[dict[str, float]]`` — per position, a mapping of token *string* to
+    logprob (up to k alternatives). We map each string to an id via the local
+    tokenizer and build the same dense ``(token_ids, logprobs)`` pair as sglang,
+    padding short positions with ``(0, MASK_LOGPROB)``.
+
+    Note the token-string→id lookup is used ONLY for the auxiliary top-k
+    alternatives, never for the sampled sequence (those ids come from
+    ``choice.token_ids``, the server's own). A string that fails to map takes the
+    sentinel pair rather than being dropped, keeping the array rectangular.
+
+    Returns ``None`` when no top-k was requested (k == 0) or the upstream
+    returned none — matching the Tinker/sglang None-when-not-requested convention.
+    """
+    if not raw or not k:
+        return None
+    token_ids: list[list[int]] = []
+    logprobs: list[list[float]] = []
+    for position in raw:
+        if not position:
+            token_ids.append([0] * k)
+            logprobs.append([MASK_LOGPROB] * k)
+            continue
+        # dict is ordered by descending logprob in vLLM; take the top-k entries.
+        items = list(position.items())[:k]
+        ids: list[int] = []
+        lps: list[float] = []
+        # unk_token_id marks "string not in vocab" for HF tokenizers; comparing
+        # against it (rather than assuming non-positive) is robust to vocabs
+        # whose unk id is positive.
+        unk_id = None
+        if tokenizer is not None:
+            try:
+                unk_id = tokenizer.unk_token_id
+            except Exception:
+                unk_id = None
+        for tok_str, lp in items:
+            tid = None
+            if tokenizer is not None:
+                try:
+                    tid = tokenizer.convert_tokens_to_ids(tok_str)
+                except Exception:
+                    tid = None
+            # convert_tokens_to_ids may return the unk id for unknown strings,
+            # or a non-scalar (list/container) on odd tokenizers. Treat any
+            # non-int, the unk id, or None as unmapped -> sentinel id.
+            if not isinstance(tid, int) or tid == unk_id:
+                ids.append(0)
+                lps.append(float(lp))  # keep the real logprob, mask only the id
+            else:
+                ids.append(int(tid))
+                lps.append(float(lp))
+        if len(ids) < k:
+            pad = k - len(ids)
+            ids += [0] * pad
+            lps += [MASK_LOGPROB] * pad
+        token_ids.append(ids)
+        logprobs.append(lps)
+    return TopkLogprobs(token_ids=token_ids, logprobs=logprobs)
+
+
 def _render_token_ids(
     messages: list[dict],
     tokenizer,
@@ -525,10 +625,10 @@ class BaseAdapter:
         # upstream backend: "sglang" (default) POSTs /generate with return_logprob;
         # "messages" forwards the raw /v1/messages body to an arbitrary messages API.
         mode = os.environ.get("UPSTREAM_MODE", "sglang").strip().lower() or "sglang"
-        if mode not in ("sglang", "messages", "chat", "responses", "tinker"):
+        if mode not in ("sglang", "messages", "chat", "responses", "tinker", "completions"):
             raise ValueError(
                 f"UPSTREAM_MODE={mode!r} must be 'sglang', 'messages', 'chat', "
-                "'responses', or 'tinker'"
+                "'responses', 'tinker', or 'completions'"
             )
         self.upstream_mode = mode
         # The unified sampling backend (Protocol). Built once at construction: this is
@@ -588,6 +688,8 @@ class BaseAdapter:
             return ResponsesUpstream(self)
         if mode == "tinker":
             return TinkerUpstream(self)
+        if mode == "completions":
+            return CompletionsUpstream(self)
         return SglangUpstream(self)  # sglang (default)
 
     def _render_prompt_for(
@@ -599,6 +701,13 @@ class BaseAdapter:
         if tok is None:
             return []
         return _render_token_ids(translated, tok, tools=tools_schema, add_generation_prompt=True)
+
+    def _completions_url(self) -> str:
+        """The base URL for the completions upstream (SLIME_COMPLETIONS_BASE_URL),
+        normalized like sglang_url. Empty string when unset (falsy, so
+        _tokenize_messages_server falls back to local render)."""
+        url = os.environ.get("SLIME_COMPLETIONS_BASE_URL")
+        return url.rstrip("/") if isinstance(url, str) else ""
 
     async def _tokenize_messages_server(
         self,
@@ -1919,6 +2028,126 @@ async def call_sglang_generate(
         finish_reason=finish,
         output_log_probs=output_log_probs,
     ), output_top_logprobs
+
+
+async def call_completions(
+    prompt_ids: list[int],
+    session: Any,
+    body: dict,
+    *,
+    adapter: BaseAdapter,
+    session_id: str | None = None,
+) -> tuple[TurnRecord, list[dict[str, float]] | None]:
+    """POST one turn to a vLLM (or sglang OpenAI-serve) ``/v1/completions`` and pack
+    the reply into a TurnRecord. Token-in token-out: the prompt goes out as a raw
+    token-id array and ``choice.token_ids`` + ``logprobs.token_logprobs`` come back
+    paired from the same response (no separate re-issue like the chat path).
+
+    Module-level (not a method) so tests can monkeypatch it, matching
+    :func:`call_sglang_generate`. The optional top-k (``top_logprobs``) is returned
+    raw for ``_completions_topk_to_typed`` to convert — it is a ``list[dict[str,
+    float]]`` here, not the sglang list-of-pairs shape.
+    """
+    logger = adapter.logger
+    base_url = (os.environ.get("SLIME_COMPLETIONS_BASE_URL") or "").rstrip("/")
+    if not base_url:
+        raise RuntimeError("UPSTREAM_MODE=completions requires SLIME_COMPLETIONS_BASE_URL")
+    if not base_url.endswith("/v1"):
+        base_url = base_url + "/v1"
+    api_key = os.environ.get("SLIME_COMPLETIONS_API_KEY") or adapter._inbound_auth.get("authorization") or ""
+    if api_key.lower().startswith("bearer "):
+        api_key = api_key[7:]
+    model = os.environ.get("SLIME_COMPLETIONS_MODEL") or "qwen3-9b"
+
+    sp = _sampling_params(session, body, max_token_keys=adapter.max_token_keys, stop_keys=adapter.stop_keys)
+    max_tokens = int(sp.get("max_new_tokens", 4096))
+
+    # context budget enforcement mirrors sglang: a prompt already over budget does
+    # not hit the network.
+    if session.max_context_tokens > 0:
+        remaining_context = session.max_context_tokens - len(prompt_ids)
+        if remaining_context <= 0:
+            logger.warning(
+                "[%s] sid=%s prompt exceeds max_context_tokens (%d >= %d)",
+                adapter.log_prefix, session_id, len(prompt_ids), session.max_context_tokens,
+            )
+            return TurnRecord(prompt_ids=list(prompt_ids), output_ids=[], finish_reason="length"), None
+        max_tokens = min(max_tokens, remaining_context)
+
+    want_logprobs = os.environ.get("SLIME_COMPLETIONS_LOGPROBS") == "1"
+    top_k = int(os.environ.get("SLIME_COMPLETIONS_TOP_LOGPROBS", "0") or "0")
+
+    # Input-side TITO: prompt is a raw token-id array; vLLM uses these ids
+    # verbatim (verified: prompt_token_ids echoes the input). The server never
+    # re-tokenizes text, so the prompt ids are exactly what the tree forks on.
+    payload: dict[str, Any] = {
+        "model": model,
+        "prompt": list(prompt_ids),
+        "max_tokens": max_tokens,
+        "stream": False,
+        "return_token_ids": True,  # top-level, the only place vLLM reads it
+    }
+    # sglang/vLLM completions read temperature/top_p/top_k/stop at the top level.
+    for k in ("temperature", "top_p", "top_k"):
+        if sp.get(k) is not None:
+            payload[k] = sp[k]
+    if sp.get("stop"):
+        payload["stop"] = sp["stop"]
+    if want_logprobs:
+        payload["logprobs"] = max(1, top_k) if top_k > 0 else 1
+
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    extra = {k: v for k, v in adapter._inbound_auth.items() if k.lower() not in ("authorization",)}
+    headers.update(extra)
+    timeout = aiohttp.ClientTimeout(total=None, sock_read=900)
+
+    async with aiohttp.ClientSession(timeout=timeout) as sess:
+        async with sess.post(f"{base_url}/completions", json=payload, headers=headers) as r:
+            if r.status >= 400:
+                text = await r.text()
+                logger.warning(
+                    "[%s] sid=%s completions upstream %d: %.200s",
+                    adapter.log_prefix, session_id, r.status, text,
+                )
+                raise RuntimeError(f"completions upstream {r.status}: {text[:400]}")
+            data = await r.json(content_type=None)
+
+    choice = (data.get("choices") or [{}])[0]
+    # Output-side TITO: ids come from the server's own choice.token_ids, and
+    # logprobs from the SAME response's logprobs.token_logprobs. A length mismatch
+    # is a server bug we surface by letting TurnRecord construction raise (the
+    # SampledSequence invariant), never by re-deriving ids from text.
+    output_ids: list[int] = []
+    ids = choice.get("token_ids")
+    if isinstance(ids, list) and ids and all(isinstance(i, int) for i in ids):
+        output_ids = list(ids)
+    output_log_probs: list[float] = []
+    if want_logprobs:
+        lp_entries = (choice.get("logprobs") or {}).get("token_logprobs") or []
+        output_log_probs = [float(x) for x in lp_entries
+                             if isinstance(x, (int, float))]
+        # logprobs without paired ids is unsafe to keep (TITO); drop both rather
+        # than pair server logprobs with re-derived ids.
+        if output_log_probs and not output_ids:
+            logger.warning(
+                "[%s] sid=%s completions returned %d logprobs but no token_ids "
+                "(needs return_token_ids); dropping logprobs — re-deriving ids "
+                "would violate token-in-token-out",
+                adapter.log_prefix, session_id, len(output_log_probs),
+            )
+            output_log_probs = []
+    # TurnRecord.__post_init__ -> SampledSequence asserts len(ids)==len(logprobs)
+    # when logprobs is non-empty; a mismatch raises here at the upstream boundary.
+    top_raw = (choice.get("logprobs") or {}).get("top_logprobs") if want_logprobs and top_k > 0 else None
+    finish = choice.get("finish_reason") or "stop"
+    return TurnRecord(
+        prompt_ids=list(prompt_ids),
+        output_ids=output_ids,
+        finish_reason=finish,
+        output_log_probs=output_log_probs,
+    ), top_raw
 
 
 _tinker_mismatch_warned: set[str] = set()

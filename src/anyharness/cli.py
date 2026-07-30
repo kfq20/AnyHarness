@@ -22,6 +22,14 @@ Upstream mode is chosen by env ``UPSTREAM_MODE``:
   supply the sampled token ids, plus ``MODEL_PATH``.
 * ``responses``: same via the OpenAI Responses API. Needs
   ``SLIME_RESPONSES_BASE_URL``. Cannot capture logprobs (no token ids in that API).
+* ``completions``: native token-in token-out against a vLLM (or sglang
+  OpenAI-serve) ``/v1/completions`` endpoint — a text-completion path structurally
+  identical to sglang's ``/generate``. The prompt goes out as a raw token-id array
+  and ``choice.token_ids`` + ``logprobs.token_logprobs`` come back paired from one
+  response. Needs ``SLIME_COMPLETIONS_BASE_URL``; ``MODEL_PATH`` is optional (the
+  server's ``/tokenize`` can render, with a local fallback).
+  ``SLIME_COMPLETIONS_LOGPROBS=1`` + ``SLIME_COMPLETIONS_TOP_LOGPROBS=N`` capture
+  per-token and top-k logprobs.
 * ``tinker``: native token-in token-out against a Tinker/Mint-style
   ``/api/v1/asample``; token ids and matching logprobs both come straight from
   the server. Needs ``MODEL_PATH`` + ``TINKER_BASE_URL`` and one of
@@ -57,10 +65,10 @@ class Config:
 
     def __init__(self) -> None:
         self.upstream_mode = os.environ.get("UPSTREAM_MODE", "sglang").strip().lower()
-        if self.upstream_mode not in ("sglang", "messages", "chat", "responses", "tinker"):
+        if self.upstream_mode not in ("sglang", "messages", "chat", "responses", "tinker", "completions"):
             raise ValueError(
-                "UPSTREAM_MODE must be 'sglang', 'messages', 'chat', 'responses', or "
-                f"'tinker', got {self.upstream_mode!r}"
+                "UPSTREAM_MODE must be 'sglang', 'messages', 'chat', 'responses', "
+                f"'tinker', or 'completions', got {self.upstream_mode!r}"
             )
 
         self.model_path = os.environ.get("MODEL_PATH") or None
@@ -102,6 +110,9 @@ class Config:
                     "tinker mode needs TINKER_MODEL_ID (a specific training step) or "
                     "TINKER_BASE_MODEL (the served base model)"
                 )
+        elif self.upstream_mode == "completions":
+            if not os.environ.get("SLIME_COMPLETIONS_BASE_URL"):
+                raise ValueError("SLIME_COMPLETIONS_BASE_URL is required in completions mode")
         else:  # chat
             if not os.environ.get("SLIME_CHAT_BASE_URL"):
                 raise ValueError("SLIME_CHAT_BASE_URL is required in chat mode")
@@ -211,14 +222,16 @@ def load_tokenizer(cfg: Config):
     """Load the HF tokenizer when one is needed (or usable).
 
     Required in sglang and tinker modes, which render the chat template locally
-    and speak token ids on the wire. Optional in chat/responses mode (those get
-    token ids from the upstream, not from us). messages mode never needs one.
+    and speak token ids on the wire. Optional in chat/responses/completions mode
+    (those get token ids from the upstream / server tokenize, not from us). In
+    completions mode a tokenizer also enables the top-k token-string→id mapping
+    (best-effort). messages mode never needs one.
     """
     if cfg.upstream_mode in ("sglang", "tinker"):
         from transformers import AutoTokenizer
 
         return AutoTokenizer.from_pretrained(cfg.model_path, trust_remote_code=True)
-    if cfg.upstream_mode in ("chat", "responses") and cfg.model_path:
+    if cfg.upstream_mode in ("chat", "responses", "completions") and cfg.model_path:
         from transformers import AutoTokenizer
 
         return AutoTokenizer.from_pretrained(cfg.model_path, trust_remote_code=True)
