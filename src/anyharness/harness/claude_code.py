@@ -1,9 +1,9 @@
 """Claude Code harness — a simplified, sandbox-pluggable version of Slime's.
 
-Slime's harness (``vendor_slime_ref/agent/harness/``) runs the Claude Code CLI
-*inside an E2B sandbox*: it installs Node + the npm CLI, pre-acks
-bypass-permissions, then launches ``claude -p ... --output-format stream-json``
-against the local AnthropicAdapter.
+Slime's harness runs the Claude Code CLI *inside an E2B sandbox*: it installs
+Node + the npm CLI, pre-acks bypass-permissions, then launches
+``claude -p ... --output-format stream-json`` against the local
+AnthropicAdapter.
 
 This module keeps the launch-and-wait shape but drops the E2B coupling: the
 sandbox is a pluggable :class:`Sandbox` protocol with two implementations
