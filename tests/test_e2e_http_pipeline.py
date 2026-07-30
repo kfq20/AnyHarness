@@ -26,10 +26,10 @@ os.environ.setdefault("SLIME_MESSAGES_UPSTREAM_URL", "http://127.0.0.1:9")
 
 from aiohttp.test_utils import TestClient, TestServer
 
-from slime_sft_trace import Sample, TurnRecord
-from slime_sft_trace.adapters.anthropic import AnthropicAdapter
-from slime_sft_trace.adapters.common import tool_call_dict
-from slime_sft_trace.dump import dump_samples_sft
+from anyharness import Sample, TurnRecord
+from anyharness.adapters.anthropic import AnthropicAdapter
+from anyharness.adapters.common import tool_call_dict
+from anyharness.dump import dump_samples_sft
 
 TOOLS = [
     {
@@ -60,7 +60,7 @@ def _build_canned_reply(adapter, *, with_tool: bool):
             blocks = [{"type": "tool_use", "id": tu_id, "name": tu["name"], "input": tu["input"]}]
             manager_message = {"role": "assistant", "content": ""}
             manager_message["tool_calls"] = [tool_call_dict(tu["name"], tu.get("input"))]
-            from slime_sft_trace.adapters.common import Reply, manager_finish_reason
+            from anyharness.adapters.common import Reply, manager_finish_reason
             return Reply(
                 manager_message=manager_message,
                 finish_reason=manager_finish_reason([tu], "tool_calls"),
@@ -91,7 +91,7 @@ async def _run_pipeline(tmp_path, body1, body2, with_tool=True):
     import secrets as _secrets
     state = {"turn": 0}
 
-    async def _canned(self, body, session_id):
+    async def _canned(self, body, session_id, translated=None, tools_schema=None):
         state["turn"] += 1
         if with_tool and state["turn"] == 1:
             blocks = [

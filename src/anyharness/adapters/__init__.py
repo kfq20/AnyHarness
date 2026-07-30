@@ -5,7 +5,7 @@ The upstream call inside BaseAdapter._run_turn is made pluggable via
 UPSTREAM_MODE (sglang | messages) — see adapters.common.
 """
 
-from slime_sft_trace.adapters.anthropic import AnthropicAdapter
-from slime_sft_trace.adapters.common import BaseAdapter
+from anyharness.adapters.anthropic import AnthropicAdapter
+from anyharness.adapters.common import BaseAdapter
 
 __all__ = ["AnthropicAdapter", "BaseAdapter"]

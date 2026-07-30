@@ -5,9 +5,9 @@ and the sampling endpoint / API server. This adapter is its core: it exposes
 ``/v1/messages`` (and ``/v1/messages/count_tokens``) downstream to the harness,
 forwards each turn upstream to a pluggable backend (sglang ``/generate`` with
 per-token logprobs, or an arbitrary messages-API — see ``UPSTREAM_MODE``),
-and feeds every turn into a shared :class:`~slime_sft_trace.trajectory.TrajectoryManager`
+and feeds every turn into a shared :class:`~anyharness.trajectory.TrajectoryManager`
 keyed by session id. ``finish_session(sid)`` drains a session's trajectory tree
-into a list of :class:`~slime_sft_trace.types.Sample`.
+into a list of :class:`~anyharness.types.Sample`.
 
 "Harness in the loop" = the adapter sits *between* the harness and the model,
 intercepting every ``/v1/messages`` call rather than fire-and-forget: it
@@ -35,7 +35,7 @@ from typing import Any
 
 from aiohttp import web
 
-from slime_sft_trace.adapters.common import (
+from anyharness.adapters.common import (
     BaseAdapter,
     Reply,
     flatten_content,
@@ -43,7 +43,7 @@ from slime_sft_trace.adapters.common import (
     sid_from_bearer,
     tool_call_dict,
 )
-from slime_sft_trace.parsing import ParsedModelOutput
+from anyharness.parsing import ParsedModelOutput
 
 logger = logging.getLogger(__name__)
 
@@ -138,7 +138,27 @@ class AnthropicAdapter(BaseAdapter):
         openai_finish = {"tool_calls": "tool_calls", "length": "length"}.get(fr, "stop")
         msg = {"role": "assistant", "content": mm.get("content", "")}
         if mm.get("tool_calls"):
-            msg["tool_calls"] = mm["tool_calls"]
+            # The tree stores `arguments` as a dict (see tool_call_dict), but the
+            # OpenAI chat wire format requires a JSON *string* — a client that
+            # json.loads() it (pi, the OpenAI SDK) otherwise sees no arguments at
+            # all and rejects the call. `id` is likewise required for the client to
+            # pair the following tool result. Matches what _respond_responses does.
+            wire_tcs: list[dict] = []
+            for i, tc in enumerate(mm["tool_calls"]):
+                if not isinstance(tc, dict):
+                    continue
+                tc2 = dict(tc)
+                fn = tc2.get("function")
+                if isinstance(fn, dict):
+                    fn = dict(fn)
+                    if isinstance(fn.get("arguments"), dict):
+                        fn["arguments"] = json.dumps(fn["arguments"], ensure_ascii=False)
+                    tc2["function"] = fn
+                tc2.setdefault("type", "function")
+                if not tc2.get("id"):
+                    tc2["id"] = f"call_{secrets.token_hex(8)}"
+                wire_tcs.append(tc2)
+            msg["tool_calls"] = wire_tcs
         if mm.get("reasoning_content"):
             msg["reasoning_content"] = mm["reasoning_content"]
         resp = {
@@ -178,6 +198,10 @@ class AnthropicAdapter(BaseAdapter):
             return [{"role": "user", "content": raw_input}], body.get("tools")
 
         translated: list[dict] = []
+        # Reasoning arrives as its own item just before the assistant turn it
+        # belongs to; held here until that turn is built. See the `reasoning`
+        # branch below.
+        pending_reasoning = ""
         instructions = body.get("instructions")
         if instructions:
             translated.append({"role": "system", "content": instructions})
@@ -186,15 +210,40 @@ class AnthropicAdapter(BaseAdapter):
             if not isinstance(item, dict):
                 continue
             itype = item.get("type")
+            # `type` is optional for message items: the Responses API accepts bare
+            # {role, content} entries and that is what the OpenAI SDK and Codex CLI
+            # actually send. Treat a typeless item carrying a role as a message --
+            # without this the whole prompt is silently dropped and the model is
+            # asked to answer nothing.
+            if itype is None and item.get("role"):
+                itype = "message"
+            if itype == "reasoning":
+                # Reasoning is replayed as its OWN top-level item, ahead of the
+                # assistant message (or function_call) it belongs to. The generated
+                # turn stores it as `reasoning_content` ON that assistant message,
+                # so it has to be re-attached here or the replay will not compare
+                # equal to the stored node and the tree forks on every thinking
+                # turn. Codex also sends `encrypted_content` (opaque, not
+                # round-trippable); the plaintext summary is what we can recover.
+                texts = [
+                    p.get("text", "") for p in (item.get("summary") or [])
+                    if isinstance(p, dict)
+                ]
+                pending_reasoning = "".join(texts)
+                continue
             if itype == "message":
                 role = item.get("role", "user")
                 content_parts = item.get("content") or []
                 # content is a list of {type:"input_text"/"output_text", text}
                 if isinstance(content_parts, str):
-                    translated.append({"role": role, "content": content_parts})
+                    msg = {"role": role, "content": content_parts}
                 else:
                     texts = [p.get("text", "") for p in content_parts if isinstance(p, dict)]
-                    translated.append({"role": role, "content": "".join(texts)})
+                    msg = {"role": role, "content": "".join(texts)}
+                if pending_reasoning and role == "assistant":
+                    msg["reasoning_content"] = pending_reasoning
+                    pending_reasoning = ""
+                translated.append(msg)
             elif itype == "function_call":
                 # assistant tool call — arguments is a JSON string
                 args = item.get("arguments", "{}")
@@ -203,15 +252,37 @@ class AnthropicAdapter(BaseAdapter):
                         args = json.loads(args) if args else {}
                     except (ValueError, TypeError):
                         args = {"_raw": args}
-                translated.append({"role": "assistant", "content": "",
-                    "tool_calls": [{"id": item.get("call_id", ""),
-                        "type": "function",
-                        "function": {"name": item.get("name", ""), "arguments": args}}]})
+                # The wire-only call id is dropped here on purpose, exactly as the
+                # messages-mode replay does via tool_call_dict: the tree matches
+                # history by dict equality, so a generated assistant turn (whose id
+                # _build_reply_parts_from_blocks also drops) must compare equal to
+                # this replayed echo. Keeping the id on one side only would fork the
+                # tree on every tool call.
+                tc = tool_call_dict(item.get("name", ""), args if isinstance(args, dict) else {})
+                # The Responses API splits one assistant turn across items: the
+                # text is a `message`, each tool call a sibling `function_call`.
+                # The chat shape the tree stores puts text + tool_calls on a SINGLE
+                # assistant message, which is what the generated node looks like --
+                # so fold this call into the immediately preceding assistant
+                # message instead of emitting a second turn (and fold sibling
+                # function_calls together into one multi-call turn).
+                prev = translated[-1] if translated else None
+                if isinstance(prev, dict) and prev.get("role") == "assistant" and not isinstance(prev, ToolMessage):
+                    prev.setdefault("tool_calls", []).append(tc)
+                    if pending_reasoning and not prev.get("reasoning_content"):
+                        prev["reasoning_content"] = pending_reasoning
+                    pending_reasoning = ""
+                else:
+                    tc_msg: dict[str, Any] = {"role": "assistant", "content": "", "tool_calls": [tc]}
+                    if pending_reasoning:
+                        tc_msg["reasoning_content"] = pending_reasoning
+                        pending_reasoning = ""
+                    translated.append(tc_msg)
             elif itype == "function_call_output":
                 # tool result — output is a string
                 translated.append(ToolMessage(role="tool",
                     content=item.get("output", ""),
-                    tool_call_id=item.get("call_id", "")))
+                    tool_call_id=item.get("call_id") or item.get("id") or ""))
 
         # tools in Responses API use the same function shape
         return translated, body.get("tools")
@@ -254,8 +325,9 @@ class AnthropicAdapter(BaseAdapter):
             "output": output, "status": status,
             "usage": {"input_tokens": in_tok, "output_tokens": out_tok, "total_tokens": in_tok + out_tok},
         }
-        # TODO: streaming (Responses SSE is complex — response.created, output_item.added, etc.)
-        return web.json_response(resp)
+        if not stream:
+            return web.json_response(resp)
+        return await _responses_sse_stream(request, resp)
 
 
 # --- Translation (Anthropic wire -> chat-template messages) ---
@@ -333,6 +405,123 @@ def _translate_messages(msgs: list[dict], system: Any) -> list[dict]:
         elif role == "system":
             translated.append({"role": "system", "content": flatten_content(content)})
     return translated
+
+
+def hub_to_anthropic_messages(translated: list[dict]) -> tuple[list[dict], str | None]:
+    """Inverse of :func:`_translate_messages`: hub (chat) shape -> Anthropic messages.
+
+    Needed when the downstream wire format is NOT Anthropic (``/v1/chat/completions``
+    or ``/v1/responses``) but ``UPSTREAM_MODE=messages``. The raw downstream body
+    cannot be forwarded in that case: a Responses body carries ``input`` where
+    ``/v1/messages`` requires ``messages`` (hard 400), and a chat body carries
+    OpenAI-shaped ``tools``/``tool_calls`` that an Anthropic upstream does not read.
+
+    Returns ``(messages, system)`` where ``system`` is the concatenated system text
+    (Anthropic takes it as a top-level field, not a message).
+
+    Two shape rules the Anthropic API enforces that the hub shape does not:
+
+    * ``tool_result`` blocks must carry a ``tool_use_id`` matching a ``tool_use``
+      in the preceding assistant turn. :func:`tool_call_dict` deliberately drops
+      wire ids (they would fork the trajectory tree), so ids are re-synthesized
+      positionally here — ``call_0``, ``call_1``, ... in emission order — and
+      consumed by the following tool messages in the same order.
+    * consecutive same-role messages must be merged into one message with
+      multiple content blocks.
+    """
+    system_parts: list[str] = []
+    msgs: list[dict] = []
+    # tool_use ids emitted by the most recent assistant turn, awaiting pairing
+    # with the tool messages that follow it.
+    pending_ids: list[str] = []
+    counter = 0
+
+    def _append(role: str, blocks: list[dict]) -> None:
+        """Append blocks, merging into the previous message when the role repeats."""
+        if not blocks:
+            return
+        if msgs and msgs[-1]["role"] == role:
+            msgs[-1]["content"].extend(blocks)
+        else:
+            msgs.append({"role": role, "content": blocks})
+
+    for m in translated:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        if role == "system":
+            text = flatten_content(m.get("content"))
+            if text:
+                system_parts.append(text)
+        elif role == "tool":
+            # Anthropic carries tool results as a user-role tool_result block.
+            tool_use_id = pending_ids.pop(0) if pending_ids else f"call_{counter}"
+            if not pending_ids:
+                counter += 1
+            _append("user", [{
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": flatten_content(m.get("content")),
+            }])
+        elif role == "assistant":
+            blocks: list[dict] = []
+            reasoning = m.get("reasoning_content")
+            if reasoning:
+                blocks.append({"type": "text", "text": flatten_content(reasoning)})
+            text = flatten_content(m.get("content"))
+            if text:
+                blocks.append({"type": "text", "text": text})
+            pending_ids = []
+            for tc in (m.get("tool_calls") or []):
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function") or {}
+                args = fn.get("arguments")
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args or "{}")
+                    except json.JSONDecodeError:
+                        args = {"_raw_arguments": args}
+                tid = tc.get("id") or f"call_{counter}"
+                counter += 1
+                pending_ids.append(tid)
+                blocks.append({
+                    "type": "tool_use",
+                    "id": tid,
+                    "name": fn.get("name", "tool"),
+                    "input": args if isinstance(args, dict) else {},
+                })
+            # An assistant turn must be non-empty to be a legal Anthropic message.
+            if not blocks:
+                blocks = [{"type": "text", "text": ""}]
+            _append("assistant", blocks)
+        else:
+            _append("user", [{"type": "text", "text": flatten_content(m.get("content"))}])
+
+    # Anthropic requires the first message to be user-role.
+    if msgs and msgs[0]["role"] == "assistant":
+        msgs.insert(0, {"role": "user", "content": [{"type": "text", "text": ""}]})
+    return msgs, ("\n\n".join(system_parts) or None)
+
+
+def chat_tools_to_anthropic_tools(tools_schema: list[dict] | None) -> list[dict] | None:
+    """Inverse of :func:`_tools_to_chat_tools`: OpenAI function tools -> Anthropic tools."""
+    if not tools_schema:
+        return None
+    out: list[dict] = []
+    for t in tools_schema:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function") if "function" in t else t
+        if not isinstance(fn, dict) or not fn.get("name"):
+            continue
+        out.append({
+            "name": fn["name"],
+            "description": fn.get("description", ""),
+            "input_schema": fn.get("parameters") or fn.get("input_schema")
+            or {"type": "object", "properties": {}},
+        })
+    return out or None
 
 
 def _tools_to_chat_tools(anth_tools: list[dict] | None) -> list[dict] | None:
@@ -529,9 +718,44 @@ def responses_output_to_blocks(response: Any) -> tuple[list[dict], str]:
     has_tool_use = False
     status = getattr(response, "status", "completed")
 
+    def _get(obj: Any, key: str) -> Any:
+        return obj.get(key) if isinstance(obj, dict) else getattr(obj, key, None)
+
     for item in getattr(response, "output", []) or []:
         item_type = getattr(item, "type", None)
-        # message item: {role, content:[{type:output_text, text}, {type:function_call, ...}]}
+
+        # `function_call` and `reasoning` are TOP-LEVEL output items in the real
+        # Responses API -- they are siblings of the message item, not parts inside
+        # its `content`. Only scanning nested content silently drops every tool
+        # call and all reasoning (an agent loop then sees an empty assistant turn
+        # and stalls). Handle them here, then fall through for message items.
+        if item_type == "function_call":
+            has_tool_use = True
+            args = _get(item, "arguments")
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args) if args else {}
+                except (ValueError, TypeError):
+                    args = {"_raw": args}
+            blocks.append({
+                "type": "tool_use",
+                "id": _get(item, "call_id") or _get(item, "id") or "",
+                "name": _get(item, "name") or "tool",
+                "input": args if isinstance(args, dict) else {},
+            })
+            continue
+        if item_type == "reasoning":
+            texts = []
+            for part in _get(item, "summary") or []:
+                text = _get(part, "text")
+                if text:
+                    texts.append(str(text))
+            joined = "".join(texts)
+            if joined:
+                blocks.append({"type": "thinking", "thinking": joined})
+            continue
+
+        # message item: {role, content:[{type:output_text, text}, ...]}
         content = getattr(item, "content", []) or []
         for part in content:
             if not isinstance(part, dict) and not hasattr(part, "type"):
@@ -571,6 +795,107 @@ def responses_output_to_blocks(response: Any) -> tuple[list[dict], str]:
 
 
 # --- Request framing: session id + wire response/stream rendering ---
+
+
+async def _responses_sse_stream(request: web.Request, resp: dict) -> web.StreamResponse:
+    """Replay a finished Responses payload as the Responses SSE event sequence.
+
+    We already have the complete reply, so this is a faithful re-emission rather
+    than incremental generation: each output item is announced, its content sent
+    as a single delta, then marked done. Clients that require the lifecycle
+    events -- notably the Codex CLI, which hard-fails with "stream closed before
+    response.completed" without them -- accept this.
+
+    Event order per the Responses spec:
+      response.created -> response.in_progress
+        -> response.output_item.added
+             (text)     response.output_text.delta / .done
+             (reasoning) response.reasoning_summary_text.delta / .done
+             (fn call)  response.function_call_arguments.delta / .done
+           response.output_item.done
+      -> response.completed
+    Every event carries a monotonic ``sequence_number``.
+    """
+    out = web.StreamResponse(
+        status=200,
+        headers={
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+    await out.prepare(request)
+
+    seq = 0
+
+    async def send(event_type: str, payload: dict) -> None:
+        nonlocal seq
+        body = {"type": event_type, "sequence_number": seq, **payload}
+        seq += 1
+        await out.write(f"event: {event_type}\ndata: {json.dumps(body, ensure_ascii=False)}\n\n".encode())
+
+    items = resp.get("output") or []
+    # response.created/in_progress advertise the response with output still empty.
+    shell = {k: v for k, v in resp.items() if k != "output"}
+    await send("response.created", {"response": {**shell, "status": "in_progress", "output": []}})
+    await send("response.in_progress", {"response": {**shell, "status": "in_progress", "output": []}})
+
+    for idx, item in enumerate(items):
+        itype = item.get("type")
+        await send("response.output_item.added", {"output_index": idx, "item": item})
+        item_id = item.get("id", "")
+
+        if itype == "message":
+            for cidx, part in enumerate(item.get("content") or []):
+                if part.get("type") != "output_text":
+                    continue
+                text = part.get("text") or ""
+                await send("response.content_part.added", {
+                    "item_id": item_id, "output_index": idx, "content_index": cidx,
+                    "part": {"type": "output_text", "text": "", "annotations": []},
+                })
+                if text:
+                    await send("response.output_text.delta", {
+                        "item_id": item_id, "output_index": idx,
+                        "content_index": cidx, "delta": text,
+                    })
+                await send("response.output_text.done", {
+                    "item_id": item_id, "output_index": idx,
+                    "content_index": cidx, "text": text,
+                })
+                await send("response.content_part.done", {
+                    "item_id": item_id, "output_index": idx, "content_index": cidx,
+                    "part": {"type": "output_text", "text": text, "annotations": []},
+                })
+        elif itype == "reasoning":
+            for sidx, summary in enumerate(item.get("summary") or []):
+                text = summary.get("text") or ""
+                if text:
+                    await send("response.reasoning_summary_text.delta", {
+                        "item_id": item_id, "output_index": idx,
+                        "summary_index": sidx, "delta": text,
+                    })
+                await send("response.reasoning_summary_text.done", {
+                    "item_id": item_id, "output_index": idx,
+                    "summary_index": sidx, "text": text,
+                })
+        elif itype == "function_call":
+            args = item.get("arguments") or ""
+            if args:
+                await send("response.function_call_arguments.delta", {
+                    "item_id": item_id, "output_index": idx, "delta": args,
+                })
+            await send("response.function_call_arguments.done", {
+                "item_id": item_id, "output_index": idx, "arguments": args,
+            })
+
+        await send("response.output_item.done", {"output_index": idx, "item": item})
+
+    terminal = "response.completed" if resp.get("status") == "completed" else "response.incomplete"
+    await send(terminal, {"response": resp})
+    await out.write_eof()
+    return out
 
 
 def _request_session_id(request: web.Request) -> str:

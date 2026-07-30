@@ -3,15 +3,19 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "slime-sft-trace"
+name = "anyharness"
 version = "0.1.0"
 description = "Build SFT trajectories from /v1/messages captures of a coding agent."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
-authors = [{ name = "slime-sft-trace contributors" }]
+authors = [{ name = "AnyHarness contributors" }]
 dependencies = [
     "aiohttp",
+    # litellm drives the chat + responses upstream modes (adapters/common.py).
+    # Kept in the base deps because chat is the recommended upstream: without it
+    # UPSTREAM_MODE=chat|responses fails at runtime with ModuleNotFoundError.
+    "litellm",
     # transformers is only needed in sglang mode (to load the HF tokenizer for
     # chat-template rendering + logprob capture). messages mode does not need
     # it; install with the `sglang` extra when capturing from sglang.
@@ -23,7 +27,7 @@ torch = ["torch"]
 test = ["pytest"]
 
 [project.scripts]
-slime-sft-trace = "slime_sft_trace.cli:main"
+anyharness = "anyharness.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -1,4 +1,4 @@
-# slime-sft-trace — AnyHarness
+# AnyHarness
 
 Build SFT training trajectories from a coding agent's `/v1/messages` traffic.
 
@@ -21,7 +21,7 @@ SFT samples.
 ## Layout
 
 ```
-src/slime_sft_trace/
+src/anyharness/
   trajectory.py        # TrajectoryManager, TurnRecord (vendored)
   types.py             # Sample (vendored)
   parsing.py            # parse_model_output (vendored)
@@ -67,7 +67,7 @@ export MODEL_PATH=Qwen/Qwen2.5-Coder-7B-Instruct
 export SLIME_SGLANG_URL=http://localhost:30000
 export PROMPT="Fix the failing test in tests/test_foo.py"
 export OUTPUT_DIR=./out
-slime-sft-trace
+anyharness
 ```
 
 messages mode (forward to an existing `/v1/messages` endpoint):
@@ -76,15 +76,84 @@ messages mode (forward to an existing `/v1/messages` endpoint):
 export UPSTREAM_MODE=messages
 export SLIME_MESSAGES_UPSTREAM_URL=https://api.example.com
 export PROMPT="..."
-slime-sft-trace
+anyharness
 ```
+
+tinker mode (token-in token-out against a Tinker/Mint gateway):
+
+```bash
+export UPSTREAM_MODE=tinker
+export TINKER_BASE_URL=http://your-mint-gateway:28000
+export TINKER_API_KEY=...                       # sent as Bearer
+export TINKER_BASE_MODEL=Qwen/Qwen3.6-35B-A3B   # or TINKER_MODEL_ID=sess-xxx_0
+export MODEL_PATH=/path/to/matching/tokenizer
+export PROMPT="..."
+anyharness
+```
+
+### Token-level data and TITO
+
+Token ids must come from whoever sampled them. Re-encoding assistant text — or
+looking a logprob's token *string* back up in a vocab — breaks the
+[token-in-token-out invariant](https://huggingface.co/blog/huggingface/tito):
+tokenization is not injective, so the recovered ids can differ from what the
+policy actually produced, and training then optimizes tokens the model never
+emitted. Where each mode stands:
+
+| Mode | Token ids from | Logprobs |
+|------|----------------|----------|
+| `tinker` | ids in, ids out (`/api/v1/asample`) | yes, paired by the server |
+| `sglang` | native `/generate` (`meta_info`) | yes |
+| `chat` | upstream `return_token_ids` (vLLM >= 0.10.2) | only if the upstream supplies ids |
+| `responses` | not available | no — the Responses API exposes no ids |
+| `messages` | n/a (message-level SFT) | no |
+
+When ids aren't available the adapter **drops** the logprobs and logs why, rather
+than reconstruct them. Message-level SFT is better than token-level data that is
+subtly wrong.
+
+In `tinker` and `sglang` mode the chat template is rendered locally, so
+`MODEL_PATH` must point at the *served* model's tokenizer. A mismatched
+tokenizer produces a prompt the server misreads — usually visible as the model
+echoing your prompt back — and the adapter warns when it detects one.
+
+### Multi-turn token drift
+
+Each turn's prompt is rendered from the full message list, so it will not always
+reproduce the ids the policy sampled last turn. For a thinking model it *cannot*:
+Qwen3's template emits `<think>...</think>` while an assistant message is the
+final message and strips it once anything follows, so the re-render diverges
+across the whole response, every turn.
+
+The trajectory builder classifies that divergence:
+
+- **CLEAN** — the prompt extends the held tokens; append the tail.
+- **REALIGN** — divergence covers only untrained tokens; heal in place and stay
+  contiguous.
+- **FORK** — divergence would overwrite *trained* tokens; close the sample and
+  open a new one instead.
+
+Trained tokens are never overwritten to preserve contiguity. Forking costs only
+contiguity — every sampled token still trains, spread across several `Sample`s
+that each re-emit the shared prefix as `loss_mask=0` context. That re-emission is
+not free: a 16-turn thinking rollout yields 16 samples and ~10x the tokens of one
+contiguous sample. The alternative — carrying sampled ids forward verbatim and
+appending only the new messages — keeps one sample but changes what the model
+conditions on (its own `<think>` blocks stay in context), and only works in modes
+where we send token ids rather than messages. It is not implemented.
 
 ### Environment
 
 | Var | Default | Meaning |
 |-----|---------|---------|
-| `UPSTREAM_MODE` | `sglang` | `sglang` (logprob capture) or `messages` (forward) |
-| `MODEL_PATH` | — | HF tokenizer path (sglang mode only, required there) |
+| `UPSTREAM_MODE` | `sglang` | `sglang`, `tinker`, `chat`, `responses`, or `messages` |
+| `MODEL_PATH` | — | HF tokenizer path (required in sglang/tinker mode) |
+| `TINKER_BASE_URL` | — | Tinker/Mint gateway base URL (tinker mode) |
+| `TINKER_API_KEY` | — | Bearer token for the gateway |
+| `TINKER_BASE_MODEL` | — | served base model, e.g. `Qwen/Qwen3.6-35B-A3B` |
+| `TINKER_MODEL_ID` | — | a specific training step instead of the base model |
+| `TINKER_LOGPROBS` | `1` | `0` disables logprob capture (it also gates prompt logprobs) |
+| `TINKER_FUTURE_TIMEOUT` | `900` | seconds to await `/retrieve_future` |
 | `SLIME_SGLANG_URL` | — | sglang base URL (sglang mode) |
 | `SLIME_MESSAGES_UPSTREAM_URL` | — | upstream `/v1/messages` URL (messages mode) |
 | `ADAPTER_PORT` | `18080` | port the adapter listens on |

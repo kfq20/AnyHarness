@@ -1,7 +1,7 @@
 """Smoke test for the vendored trajectory layer.
 
 Does NOT need a real model, sglang, or the claude binary. It builds a
-:class:`~slime_sft_trace.TrajectoryManager` directly, feeds it 2-3 hand-built
+:class:`~anyharness.TrajectoryManager` directly, feeds it 2-3 hand-built
 turns (via :meth:`record_turn` with explicit token ids), and asserts that
 :meth:`get_trajectory` produces :class:`Sample` objects whose ``loss_mask``
 marks prompt tokens as 0 and model-response tokens as 1.
@@ -28,10 +28,10 @@ import pytest
 # The trajectory layer is vendored by a parallel agent. If their files are not
 # ready at collection time, skip with a clear message rather than erroring.
 try:
-    from slime_sft_trace import Sample, TrajectoryManager, TurnRecord
+    from anyharness import Sample, TrajectoryManager, TurnRecord
 except Exception as exc:  # pragma: no cover - depends on other agents' files
     pytest.skip(
-        f"slime_sft_trace trajectory layer not importable yet (parallel agent "
+        f"anyharness trajectory layer not importable yet (parallel agent "
         f"not finished): {exc!r}",
         allow_module_level=True,
     )

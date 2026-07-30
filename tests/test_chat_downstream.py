@@ -8,6 +8,7 @@ use chat-completions wire format.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import socket
 
@@ -15,8 +16,8 @@ import aiohttp
 import pytest
 from aiohttp import web
 
-from slime_sft_trace import Sample
-from slime_sft_trace.adapters import AnthropicAdapter
+from anyharness import Sample
+from anyharness.adapters import AnthropicAdapter
 
 
 def _free_port() -> int:
@@ -105,12 +106,20 @@ def test_chat_downstream_multi_turn_tool_loop():
     roles = [m["role"] for m in samples[0].prompt]
     assert roles == ["user", "assistant", "tool", "assistant"], f"roles: {roles}"
     assert samples[0].metadata["use_tool"] is True
-    # assistant turn 1 has tool_calls with dict arguments
+    # assistant turn 1 has tool_calls; the chat wire format serializes
+    # arguments to a JSON string (the OpenAI live-API shape), so a client
+    # that json.loads() it recovers the dict.
     asst1 = samples[0].prompt[1]
     assert asst1.get("tool_calls")
-    assert isinstance(asst1["tool_calls"][0]["function"]["arguments"], dict)
-    # tool message has tool_call_id + name
+    args = asst1["tool_calls"][0]["function"]["arguments"]
+    assert isinstance(args, str)  # wire shape
+    assert json.loads(args) == {"file_path": "/tmp/x.py"}
+    assert asst1["tool_calls"][0]["id"]  # id required to pair the tool result
+    # tool message has tool_call_id + name; the id is synthesized by the adapter
+    # (the upstream's wire id is dropped, per tool_call_dict's tree-matching
+    # invariant) and must match the assistant turn's tool_call id above.
     tool_msg = samples[0].prompt[2]
     assert tool_msg["role"] == "tool"
-    assert tool_msg.get("tool_call_id") == "call_1"
+    assert tool_msg.get("tool_call_id")
+    assert tool_msg.get("tool_call_id") == asst1["tool_calls"][0]["id"]
     assert tool_msg.get("name") == "Read"

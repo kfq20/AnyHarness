@@ -14,9 +14,6 @@ venv/
 *.jsonl
 !tests/**/*.jsonl
 
-# vendored slime reference (not part of the package)
-/vendor_slime_ref/
-
 # throwaway repro/probe scripts (dev-only)
 /repro_*.py
 /probe_*.py

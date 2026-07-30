@@ -14,19 +14,20 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import itertools
 import json
 import logging
 import os
 import time
 import uuid
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 import aiohttp
 from aiohttp import web
 
-from slime_sft_trace.parsing import parse_model_output
-from slime_sft_trace.trajectory import TrajectoryManager, TurnRecord
+from anyharness.parsing import parse_model_output
+from anyharness.trajectory import TrajectoryManager, TurnRecord
 
 
 __all__ = ["TurnRecord"]
@@ -57,6 +58,130 @@ class Reply:
     wire: Any
 
 
+@dataclasses.dataclass(frozen=True)
+class SamplingResult:
+    """One upstream turn. Exactly one of (content_blocks | token-level ids) is
+    meaningful; the consumer branches on ``content_blocks``, not on a mode string.
+
+    Block-level backends (messages/chat/responses) set ``content_blocks`` and leave
+    ``turn.output_ids`` empty; token-level backends (sglang/tinker) leave
+    ``content_blocks`` None and populate ``turn.output_ids``/``output_log_probs``.
+    ``top_logprobs`` carries the per-turn top-k (sglang only) that used to live on
+    the ``_last_top_logprobs`` side-effect channel.
+    """
+
+    turn: TurnRecord
+    content_blocks: list[dict] | None = None
+    top_logprobs: list | None = None
+
+
+@runtime_checkable
+class SamplingUpstream(Protocol):
+    """A sampling backend behind the messages->token-ids abstraction.
+
+    Each implementation encapsulates its own rendering: server-backed backends
+    (messages/chat/responses) delegate render to the upstream; token-native
+    backends (sglang/tinker) render locally. ``message_level`` selects the
+    trajectory-dump path (block-level vs token-level) without a mode-string check.
+    """
+
+    message_level: bool
+
+    async def sample(
+        self,
+        messages: list[dict],
+        tools_schema: list[dict] | None,
+        body: dict,
+        session: "Session",
+        session_id: str | None,
+    ) -> SamplingResult: ...
+
+
+class _DelegatingUpstream:
+    """Base for the Phase-1 implementations: holds the adapter and delegates to
+    its existing ``_call_*_upstream`` methods / module functions. The delegation
+    keeps behaviour byte-identical (87-test contract) while the dispatch and
+    consumption sites move to the unified interface. Subclasses set ``message_level``
+    and implement :meth:`sample`.
+    """
+
+    message_level = False
+
+    def __init__(self, adapter: "BaseAdapter") -> None:
+        self._a = adapter
+
+
+class MessagesUpstream(_DelegatingUpstream):
+    """``UPSTREAM_MODE=messages``: forward a /v1/messages body verbatim (or rebuilt
+    from hub messages when the downstream wire is chat/responses). Block-level."""
+
+    message_level = True
+
+    async def sample(self, messages, tools_schema, body, session, session_id):
+        turn, blocks = await self._a._call_messages_upstream(
+            body, session_id, translated=messages, tools_schema=tools_schema
+        )
+        return SamplingResult(turn=turn, content_blocks=blocks)
+
+
+class ChatUpstream(_DelegatingUpstream):
+    """``UPSTREAM_MODE=chat``: litellm.acompletion against an OpenAI-compatible
+    endpoint. Block-level; logprobs (with vLLM return_token_ids) ship on the turn."""
+
+    message_level = True
+
+    async def sample(self, messages, tools_schema, body, session, session_id):
+        turn = await self._a._call_chat_upstream(messages, tools_schema, body, session_id)
+        return SamplingResult(turn=turn, content_blocks=self._a._last_content_blocks)
+
+
+class ResponsesUpstream(_DelegatingUpstream):
+    """``UPSTREAM_MODE=responses``: litellm.aresponses against the Responses API.
+    Block-level; no TITO token ids on this API."""
+
+    message_level = True
+
+    async def sample(self, messages, tools_schema, body, session, session_id):
+        turn = await self._a._call_responses_upstream(messages, tools_schema, body, session_id)
+        return SamplingResult(turn=turn, content_blocks=self._a._last_content_blocks)
+
+
+class SglangUpstream(_DelegatingUpstream):
+    """``UPSTREAM_MODE=sglang``: native ``/generate`` with return_logprob.
+    Token-level (real output_ids + logprobs); carries per-turn top-k."""
+
+    message_level = False
+
+    async def sample(self, messages, tools_schema, body, session, session_id):
+        # sglang >= 0.5.12 exposes /v1/tokenize with messages, so the server can
+        # render the chat template itself and we skip the local tokenizer entirely
+        # (TITO-safe: the ids come from the server, not from re-encoding text).
+        # Fall back to local render when the server can't (old sglang / no URL).
+        prompt_ids = await self._a._tokenize_messages_server(
+            self._a.sglang_url, messages, tools_schema, session_id
+        )
+        if not prompt_ids:
+            prompt_ids = self._a._render_prompt_for(messages, tools_schema)
+        turn, top_k = await call_sglang_generate(
+            prompt_ids, session, body, adapter=self._a, session_id=session_id
+        )
+        return SamplingResult(turn=turn, top_logprobs=top_k)
+
+
+class TinkerUpstream(_DelegatingUpstream):
+    """``UPSTREAM_MODE=tinker``: native ``/api/v1/asample`` + retrieve_future.
+    Token-in token-out (real output_ids + logprobs)."""
+
+    message_level = False
+
+    async def sample(self, messages, tools_schema, body, session, session_id):
+        prompt_ids = self._a._render_prompt_for(messages, tools_schema)
+        turn, _ = await call_tinker_sample(
+            prompt_ids, session, body, adapter=self._a, session_id=session_id
+        )
+        return SamplingResult(turn=turn)
+
+
 def _render_token_ids(
     messages: list[dict],
     tokenizer,
@@ -73,6 +198,36 @@ def _render_token_ids(
     )
     ids = enc["input_ids"] if hasattr(enc, "__getitem__") and "input_ids" in enc else enc
     return list(ids)
+
+
+class _AttrView:
+    """Read-only attribute view over a parsed JSON dict.
+
+    ``responses_output_to_blocks`` reads the upstream payload with ``getattr``
+    (it normally receives a pydantic model). When we parse a Responses body
+    ourselves we hand it this instead, so nested items expose ``.type`` /
+    ``.content`` while leaf parts stay plain dicts -- which that function already
+    handles via its ``isinstance(part, dict)`` branches.
+    """
+
+    __slots__ = ("_d",)
+
+    def __init__(self, d: dict) -> None:
+        self._d = d
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            val = self._d[name]
+        except KeyError:
+            raise AttributeError(name) from None
+        if isinstance(val, dict):
+            return _AttrView(val)
+        if isinstance(val, list):
+            return [_AttrView(v) if isinstance(v, dict) else v for v in val]
+        return val
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"_AttrView({self._d!r})"
 
 
 def flatten_content(c: Any) -> str:
@@ -160,6 +315,28 @@ def manager_finish_reason(tool_uses: list[dict], raw_finish: str) -> str:
     return "tool_calls" if tool_uses else (raw_finish or "stop")
 
 
+def _extract_upstream_token_ids(choice: Any) -> list[int] | None:
+    """Pull the upstream's own generated token ids off a chat-completions choice.
+
+    vLLM >= 0.10.2 returns them on the OpenAI-compatible endpoint when the request
+    sets ``return_token_ids: true`` (field ``token_ids`` on the choice; the prompt
+    side arrives as ``prompt_token_ids``). These are the ids the server actually
+    sampled, which is the only TITO-safe source: token ids must never be
+    reconstructed by re-encoding decoded text or by looking token *strings* back
+    up in a vocab, because tokenization is not injective and the recovered
+    sequence may differ from what the policy produced.
+
+    Returns ``None`` when the upstream did not supply ids (not vLLM, too old, or
+    the flag was rejected). Callers must drop logprobs in that case rather than
+    fall back to reconstruction.
+    """
+    for holder in (choice, getattr(choice, "model_extra", None) or {}):
+        ids = holder.get("token_ids") if isinstance(holder, dict) else getattr(holder, "token_ids", None)
+        if isinstance(ids, list) and ids and all(isinstance(i, int) for i in ids):
+            return list(ids)
+    return None
+
+
 class BaseAdapter:
     """Base HTTP adapter: session lifecycle plus the shared one-turn pipeline.
 
@@ -190,9 +367,16 @@ class BaseAdapter:
         # upstream backend: "sglang" (default) POSTs /generate with return_logprob;
         # "messages" forwards the raw /v1/messages body to an arbitrary messages API.
         mode = os.environ.get("UPSTREAM_MODE", "sglang").strip().lower() or "sglang"
-        if mode not in ("sglang", "messages", "chat", "responses"):
-            raise ValueError(f"UPSTREAM_MODE={mode!r} must be 'sglang', 'messages', 'chat', or 'responses'")
+        if mode not in ("sglang", "messages", "chat", "responses", "tinker"):
+            raise ValueError(
+                f"UPSTREAM_MODE={mode!r} must be 'sglang', 'messages', 'chat', "
+                "'responses', or 'tinker'"
+            )
         self.upstream_mode = mode
+        # The unified sampling backend (Protocol). Built once at construction: this is
+        # the single place a mode string is read to pick an implementation — every
+        # later dispatch is through self.upstream.sample(...) / .message_level.
+        self.upstream = self._build_upstream(mode)
         self.tool_parser = tool_parser
         self.reasoning_parser = reasoning_parser
         self.store: dict[str, Any] = {}
@@ -232,6 +416,75 @@ class BaseAdapter:
 
     # -- upstream dispatch ------------------------------------------------------
 
+    def _build_upstream(self, mode: str) -> SamplingUpstream:
+        """Pick the sampling backend implementation. The single mode-string read;
+        every later dispatch goes through the returned object."""
+        if mode == "messages":
+            return MessagesUpstream(self)
+        if mode == "chat":
+            return ChatUpstream(self)
+        if mode == "responses":
+            return ResponsesUpstream(self)
+        if mode == "tinker":
+            return TinkerUpstream(self)
+        return SglangUpstream(self)  # sglang (default)
+
+    def _render_prompt_for(
+        self, translated: list[dict], tools_schema: list[dict] | None
+    ) -> list[int]:
+        """Render hub-format messages to token ids (sglang/tinker). No-op when no
+        tokenizer is configured (returns []); server-backed backends don't call this."""
+        tok = self.tokenizer
+        if tok is None:
+            return []
+        return _render_token_ids(translated, tok, tools=tools_schema, add_generation_prompt=True)
+
+    async def _tokenize_messages_server(
+        self,
+        base_url: str,
+        translated: list[dict],
+        tools_schema: list[dict] | None,
+        session_id: str | None,
+    ) -> list[int] | None:
+        """Render messages to token ids via the upstream server's tokenize endpoint.
+
+        Avoids the local tokenizer entirely when the server can render the chat
+        template itself. Verified against vLLM 0.26 (``POST /tokenize`` with
+        ``messages``) and sglang >= 0.5.12 (``POST /v1/tokenize`` with ``messages``).
+        Returns ``None`` (caller falls back to local render) on any failure — a
+        missing/old/errored endpoint is a silent degradation, not a hard error.
+        """
+        if not base_url:
+            return None
+        url = base_url.rstrip("/")
+        # vLLM exposes /tokenize; sglang exposes /v1/tokenize. Try both shapes; the
+        # server that doesn't recognise the path 404s and we fall back.
+        for path in ("/tokenize", "/v1/tokenize"):
+            payload: dict[str, Any] = {
+                "messages": translated,
+                "add_generation_prompt": True,
+            }
+            if tools_schema:
+                payload["tools"] = tools_schema
+            try:
+                async with aiohttp.ClientSession() as sess:
+                    async with sess.post(
+                        f"{url}{path}", json=payload,
+                        headers={"Content-Type": "application/json", **self._inbound_auth},
+                    ) as r:
+                        if r.status >= 400:
+                            continue  # try the other path / fall back
+                        data = await r.json(content_type=None)
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                return None
+            ids = data.get("input_ids") or data.get("tokens") or []
+            if isinstance(ids, list) and ids:
+                self.logger.debug(
+                    "[%s] sid=%s server-side tokenize -> %d ids", self.log_prefix, session_id, len(ids),
+                )
+                return [int(i) for i in ids]
+        return None
+
     async def _call_upstream(
         self,
         prompt_ids: list[int],
@@ -241,50 +494,81 @@ class BaseAdapter:
         *,
         translated: list[dict] | None = None,
         tools_schema: list[dict] | None = None,
-    ) -> TurnRecord:
-        """Forward one turn to the configured upstream backend and pack the reply.
+    ) -> SamplingResult:
+        """Forward one turn to the configured upstream backend.
 
-        Dispatches on ``self.upstream_mode`` (read from ``UPSTREAM_MODE``):
-
-        * ``sglang`` (default): the original path — render the prompt to
-          token ids and POST them to ``{sglang_url}/generate`` with
-          ``return_logprob: True``, then parse ``meta_info.output_token_logprobs``
-          into token-level ids and logprobs (delegated to the module-level
-          :func:`call_sglang_generate`).
-        * ``messages``: forward the *raw* ``/v1/messages`` request body as-is to
-          ``SLIME_MESSAGES_UPSTREAM_URL`` (any messages-API upstream: real
-          Anthropic, lsai, mintcn, ...), decode the assistant text out of the
-          stream/non-stream response, and re-tokenize it so the downstream
-          tree/parser see real output tokens. No logprobs are available in this
-          mode, so ``output_log_probs`` is ``[]`` (message-level SFT only).
-        * ``chat``: route the chat-completions shape (the tree's hub format) to
-          ``litellm.acompletion`` against ``SLIME_CHAT_BASE_URL`` (any
-          OpenAI-compatible endpoint). litellm picks the wire format; the
-          response is re-shaped to Anthropic content blocks and replayed through
-          the messages-mode reply path. No logprobs (message-level SFT only).
+        Dispatch is a single call to ``self.upstream.sample``; the implementation
+        (Messages/Chat/Responses/Sglang/Tinker) encapsulates its own rendering and
+        returns a :class:`SamplingResult`. Block-level backends set
+        ``content_blocks``; token-level backends set ``turn.output_ids`` +
+        ``top_logprobs``. The side-effect channels (``_last_content_blocks`` /
+        ``_last_top_logprobs``) are absorbed into the result here for the
+        legacy consumers that still read them.
         """
-        if self.upstream_mode == "messages":
-            turn, blocks = await self._call_messages_upstream(body, session_id)
-            self._last_content_blocks = blocks
-            return turn
-        if self.upstream_mode == "chat":
-            return await self._call_chat_upstream(translated, tools_schema, body, session_id)
-        if self.upstream_mode == "responses":
-            return await self._call_responses_upstream(translated, tools_schema, body, session_id)
-        # sglang: call_sglang_generate returns (TurnRecord, top_k_logprobs|None)
-        turn, top_k = await call_sglang_generate(
-            prompt_ids, session, body, adapter=self, session_id=session_id
+        result = await self.upstream.sample(
+            translated or [], tools_schema, body, session, session_id
         )
-        # stash per-turn top-k logprobs for _run_turn to attach to the record.
-        self._last_top_logprobs = top_k
-        return turn
+        # Keep the legacy side-effect channels populated for any caller still
+        # reading them (finish_session reads _last_top_logprobs; tests assert on
+        # _last_content_blocks). _run_turn now reads result.* directly.
+        if result.content_blocks is not None:
+            self._last_content_blocks = result.content_blocks
+        if result.top_logprobs is not None:
+            self._last_top_logprobs = result.top_logprobs
+        return result
+
+    def _anthropic_body_from_hub(
+        self,
+        body: dict,
+        translated: list[dict] | None,
+        tools_schema: list[dict] | None,
+    ) -> dict:
+        """Build a legal Anthropic /v1/messages body from hub-format messages.
+
+        Used when the downstream wire format is chat/responses but the upstream
+        speaks the messages API. ``max_tokens`` is required by the Anthropic API,
+        so a default is supplied when the downstream body omits it (the Responses
+        API spells it ``max_output_tokens``).
+        """
+        from anyharness.adapters.anthropic import (
+            chat_tools_to_anthropic_tools,
+            hub_to_anthropic_messages,
+        )
+
+        msgs, system = hub_to_anthropic_messages(translated or [])
+        out: dict[str, Any] = {
+            "model": os.environ.get("SLIME_MESSAGES_MODEL") or body.get("model") or "slime-actor",
+            "messages": msgs,
+            "max_tokens": int(
+                body.get("max_tokens") or body.get("max_output_tokens") or 4096
+            ),
+        }
+        if system:
+            out["system"] = system
+        anth_tools = chat_tools_to_anthropic_tools(tools_schema)
+        if anth_tools:
+            out["tools"] = anth_tools
+        for k in ("temperature", "top_p", "stop_sequences"):
+            if body.get(k) is not None:
+                out[k] = body[k]
+        return out
 
     async def _call_messages_upstream(
         self,
         body: dict,
         session_id: str | None,
+        translated: list[dict] | None = None,
+        tools_schema: list[dict] | None = None,
     ) -> TurnRecord:
-        """Forward the raw /v1/messages body to an arbitrary messages-API upstream.
+        """Forward a /v1/messages body to an arbitrary messages-API upstream.
+
+        When the downstream wire format is already Anthropic (``/v1/messages``),
+        ``body`` is forwarded verbatim as before. When it is ``chat`` or
+        ``responses``, the body is rebuilt from the hub-format ``translated``
+        messages via :func:`hub_to_anthropic_messages`, because the raw body is
+        not a legal ``/v1/messages`` payload: a Responses body carries ``input``
+        instead of ``messages`` (hard 400 from the upstream), and a chat body
+        carries OpenAI-shaped ``tools`` an Anthropic upstream will not read.
 
         No tokenizer round-trip is performed on the prompt (we forward ``body``
         verbatim), so ``prompt_ids`` is empty and only the assistant text is
@@ -307,7 +591,10 @@ class BaseAdapter:
         # upstream response; downstream we always feed decoded text into
         # parse_model_output, so we collapse any stream to its final assistant text.
         want_stream = bool(body.get("stream"))
-        fwd_body = dict(body)
+        if getattr(self, "_downstream_format", "messages") == "messages":
+            fwd_body = dict(body)
+        else:
+            fwd_body = self._anthropic_body_from_hub(body, translated, tools_schema)
         fwd_body["stream"] = want_stream
         timeout = aiohttp.ClientTimeout(total=None, sock_read=900)
         finish_reason = "stop"
@@ -369,6 +656,95 @@ class BaseAdapter:
             output_log_probs=[],
         ), content_blocks
 
+    def _pair_logprobs_with_upstream_ids(
+        self,
+        token_ids: list[int] | None,
+        log_probs: list[float],
+        *,
+        session_id: str | None,
+        mode: str,
+    ) -> tuple[list[int], list[float]]:
+        """Pair captured logprobs with the upstream's own token ids, or drop both.
+
+        ``record_turn`` asserts ``len(output_log_probs) == len(output_ids)``, so
+        logprobs are only usable alongside exactly one id per value — and TITO
+        requires those ids be the ones the server sampled, not ids recovered from
+        decoded text or from vocab lookups of token strings (tokenization is not
+        injective, so a recovered sequence can differ from what the policy
+        produced, silently training on tokens it never generated).
+
+        Returns ``([], [])`` when the upstream supplied no ids or the counts
+        disagree. Dropping is deliberate: there is no safe reconstruction, and
+        message-level SFT is strictly better than token-level data that is subtly
+        wrong. Enable ids by pointing ``chat`` mode at vLLM >= 0.10.2, or use
+        ``UPSTREAM_MODE=sglang`` whose ``/generate`` path is natively token-in
+        token-out.
+        """
+        if not log_probs:
+            return [], []
+        if not token_ids:
+            self.logger.warning(
+                "[%s] sid=%s %s upstream returned %d logprobs but no token_ids "
+                "(needs vLLM >= 0.10.2 honouring return_token_ids); dropping "
+                "logprobs — re-deriving ids would violate token-in-token-out",
+                self.log_prefix, session_id, mode, len(log_probs),
+            )
+            return [], []
+        if len(token_ids) != len(log_probs):
+            self.logger.warning(
+                "[%s] sid=%s %s upstream token_ids (%d) and logprobs (%d) disagree; "
+                "dropping both rather than emit a misaligned pair",
+                self.log_prefix, session_id, mode, len(token_ids), len(log_probs),
+            )
+            return [], []
+        return token_ids, log_probs
+
+    async def _chat_upstream_token_ids(
+        self, base_url: str, api_key: str, kwargs: dict, session_id: str | None
+    ) -> list[int] | None:
+        """Re-issue the chat call over plain HTTP to recover sampled token ids.
+
+        litellm <= 1.88 keeps ``extra_body`` nested, so vLLM (>=0.10.2) returns
+        ``token_ids: None`` even with the flag set. We reach here only when the
+        litellm path already returned logprobs but no ids -- so this is a recovery
+        on a path that was otherwise about to drop the logprobs. Sending
+        ``return_token_ids`` at the top level (not in extra_body) is what vLLM
+        actually reads. One extra request beats silently losing token-level data.
+        """
+        if not base_url:
+            return None
+        url = base_url.rstrip("/")
+        if not url.endswith("/chat/completions"):
+            url = f"{url}/chat/completions"
+        payload = {
+            k: v for k, v in kwargs.items()
+            if k not in ("api_base", "api_key", "extra_headers", "extra_body", "model")
+        }
+        payload["model"] = str(kwargs.get("model", "")).split("/", 1)[-1]
+        payload["return_token_ids"] = True  # top-level, the only place vLLM reads it
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        headers.update(kwargs.get("extra_headers") or {})
+        try:
+            async with aiohttp.ClientSession() as sess:
+                async with sess.post(url, json=payload, headers=headers) as resp:
+                    if resp.status >= 400:
+                        return None
+                    data = json.loads(await resp.text())
+        except Exception:
+            return None
+        choice = (data.get("choices") or [{}])[0]
+        ids = choice.get("token_ids")
+        if isinstance(ids, list) and ids and all(isinstance(i, int) for i in ids):
+            self.logger.info(
+                "[%s] sid=%s recovered %d token ids via raw HTTP (litellm extra_body "
+                "not flattened); ids now TITO-safe",
+                self.log_prefix, session_id, len(ids),
+            )
+            return list(ids)
+        return None
+
     async def _call_chat_upstream(
         self,
         translated: list[dict],
@@ -385,7 +761,8 @@ class BaseAdapter:
         :func:`chat_response_to_blocks`, stashed on ``self._last_content_blocks``
         so ``_run_turn``'s messages-mode reply path builds the manager_message
         (with tool_calls / reasoning_content) and renders the Anthropic response
-        back to Claude Code. No logprobs (message-level SFT only).
+        back to Claude Code. Message-level SFT by default; ``SLIME_CHAT_LOGPROBS=1``
+        adds per-token logprobs when a tokenizer can align them to ids.
 
         Env: ``SLIME_CHAT_BASE_URL``, ``SLIME_CHAT_API_KEY``, ``SLIME_CHAT_MODEL``
         (e.g. an OpenAI-compatible gateway). Auth from the inbound request
@@ -394,7 +771,7 @@ class BaseAdapter:
         """
         import litellm
 
-        from slime_sft_trace.adapters.anthropic import chat_response_to_blocks
+        from anyharness.adapters.anthropic import chat_response_to_blocks
 
         base_url = os.environ.get("SLIME_CHAT_BASE_URL") or ""
         # litellm appends /chat/completions to api_base, so it must end with /v1.
@@ -445,6 +822,12 @@ class BaseAdapter:
             top_k = int(os.environ.get("SLIME_CHAT_TOP_LOGPROBS", "0") or "0")
             if top_k > 0:
                 kwargs["top_logprobs"] = top_k
+            # Ask the server for the token ids it sampled (vLLM >= 0.10.2). This is
+            # the only TITO-safe way to align logprobs to ids; without it the
+            # logprobs get dropped below. Passed via extra_body since it is a vLLM
+            # extension, not an OpenAI field. Note vllm#27482: return_token_ids can
+            # drop tokens on *streaming* tool calls — this path is non-streaming.
+            kwargs["extra_body"] = {**kwargs.get("extra_body", {}), "return_token_ids": True}
 
         try:
             response = await litellm.acompletion(**kwargs)
@@ -461,6 +844,7 @@ class BaseAdapter:
         # TurnRecord is left to the sglang path; chat stores the sampled-token
         # logprob only (sufficient for GRPO; top-k is in the response object if needed).
         output_log_probs: list[float] = []
+        upstream_ids: list[int] | None = None
         if os.environ.get("SLIME_CHAT_LOGPROBS") == "1":
             try:
                 choice = response.choices[0]
@@ -470,8 +854,25 @@ class BaseAdapter:
                         lp_val = getattr(entry, "logprob", None)
                         if lp_val is not None:
                             output_log_probs.append(float(lp_val))
+                upstream_ids = _extract_upstream_token_ids(choice)
             except (AttributeError, IndexError, TypeError):
                 pass  # upstream didn't return logprobs despite the request
+
+        # litellm <= 1.88 ships `extra_body` nested instead of flattened to the
+        # top level, so vLLM (>=0.10.2) silently returns token_ids=None even with
+        # the flag set. Retry once over plain HTTP with return_token_ids at the
+        # top level -- the ids are the only TITO-safe source, so the extra request
+        # (only on a path that was about to drop the logprobs anyway) is worth it.
+        if output_log_probs and not upstream_ids:
+            upstream_ids = await self._chat_upstream_token_ids(
+                base_url, api_key, kwargs, session_id
+            )
+
+        # record_turn asserts len(output_log_probs) == len(output_ids); ids must come
+        # from the upstream (TITO), never be re-derived here.
+        output_ids, output_log_probs = self._pair_logprobs_with_upstream_ids(
+            upstream_ids, output_log_probs, session_id=session_id, mode="chat"
+        )
 
         # map Anthropic stop_reason -> sglang finish_reason shape (tool_use->tool_calls etc.)
         finish = {
@@ -480,7 +881,76 @@ class BaseAdapter:
             "stop_sequence": "stop",
             "tool_use": "tool_calls",
         }.get(stop_reason, stop_reason or "stop")
-        return TurnRecord(prompt_ids=[], output_ids=[], finish_reason=finish, output_log_probs=output_log_probs)
+        return TurnRecord(
+            prompt_ids=[], output_ids=output_ids, finish_reason=finish, output_log_probs=output_log_probs
+        )
+
+    async def _call_responses_upstream_raw(
+        self,
+        kwargs: dict[str, Any],
+        base_url: str,
+        api_key: str,
+        session_id: str | None,
+        *,
+        litellm_error: Exception,
+    ) -> Any | None:
+        """Re-issue a Responses call as plain HTTP, bypassing litellm's validation.
+
+        Returns an object exposing ``.output`` / ``.status`` (what
+        ``responses_output_to_blocks`` reads via ``getattr``), or ``None`` when the
+        upstream genuinely failed and the original litellm error should surface.
+
+        This exists because litellm's ``ResponsesAPIResponse`` requires
+        ``created_at``; an upstream that omits it gets its 200 turned into an
+        ``APIError`` even though the body carries complete output. We only reach
+        here after litellm already raised, so the cost is one extra request on a
+        path that was otherwise about to fail the whole turn.
+        """
+        url = base_url.rstrip("/")
+        if not url.endswith("/responses"):
+            url = f"{url}/responses"
+        payload = {
+            k: v for k, v in kwargs.items()
+            if k not in ("api_base", "api_key", "extra_headers", "model")
+        }
+        # litellm takes "openai/<model>"; the wire wants the bare model name.
+        payload["model"] = str(kwargs.get("model", "")).split("/", 1)[-1]
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        headers.update(kwargs.get("extra_headers") or {})
+
+        try:
+            async with aiohttp.ClientSession() as sess:
+                async with sess.post(url, json=payload, headers=headers) as resp:
+                    text = await resp.text()
+                    if resp.status >= 400:
+                        self.logger.warning(
+                            "[%s] sid=%s responses raw fallback got HTTP %s: %s",
+                            self.log_prefix, session_id, resp.status, text[:200],
+                        )
+                        return None
+                    data = json.loads(text)
+        except Exception as exc:  # network / JSON failure: surface the original
+            self.logger.warning(
+                "[%s] sid=%s responses raw fallback failed: %s", self.log_prefix, session_id, exc
+            )
+            return None
+
+        if not isinstance(data, dict) or "output" not in data:
+            return None
+
+        missing = sorted(
+            f for f in ("created_at",) if f not in data
+        )
+        self.logger.warning(
+            "[%s] sid=%s Responses upstream is missing %s, which litellm requires "
+            "(%s: %s); parsed the 200 directly instead. Output is intact; this only "
+            "bypasses litellm's schema validation.",
+            self.log_prefix, session_id, missing or "required field(s)",
+            type(litellm_error).__name__, str(litellm_error)[:120],
+        )
+        return _AttrView(data)
 
     async def _call_responses_upstream(
         self,
@@ -504,7 +974,7 @@ class BaseAdapter:
         """
         import litellm
 
-        from slime_sft_trace.adapters.anthropic import responses_output_to_blocks
+        from anyharness.adapters.anthropic import responses_output_to_blocks
 
         base_url = os.environ.get("SLIME_RESPONSES_BASE_URL") or ""
         model = os.environ.get("SLIME_RESPONSES_MODEL") or "gpt-4o"
@@ -529,7 +999,22 @@ class BaseAdapter:
             "stream": False,
         }
         if tools_schema:
-            kwargs["tools"] = tools_schema
+            # Tools arrive in the OpenAI chat-completions shape
+            # ({type:function, function:{name,description,parameters}}) because the
+            # hub format is chat-shaped. The Responses API wants them FLAT
+            # ({type:function, name, description, parameters}) -- send the nested
+            # shape and the upstream silently ignores the tools, so the model
+            # answers in prose instead of emitting a function_call.
+            kwargs["tools"] = [
+                {
+                    "type": "function",
+                    "name": t["function"]["name"],
+                    "description": t["function"].get("description", ""),
+                    "parameters": t["function"].get("parameters") or {"type": "object", "properties": {}},
+                }
+                for t in tools_schema
+                if isinstance(t, dict) and t.get("function")
+            ]
         if body.get("max_tokens"):
             kwargs["max_output_tokens"] = int(body["max_tokens"])
         if include:
@@ -543,8 +1028,19 @@ class BaseAdapter:
         try:
             response = await litellm.aresponses(**kwargs)
         except Exception as exc:
-            self.logger.warning("[%s] sid=%s responses upstream failed: %s", self.log_prefix, session_id, exc)
-            raise
+            # litellm validates the payload against its own ResponsesAPIResponse
+            # model, which requires `created_at` -- a field several Responses-API
+            # implementations omit. Such an upstream returns a perfectly usable 200
+            # that litellm still raises on, so retry once over plain HTTP and parse
+            # the body ourselves rather than failing the turn.
+            response = await self._call_responses_upstream_raw(
+                kwargs, base_url, api_key, session_id, litellm_error=exc
+            )
+            if response is None:
+                self.logger.warning(
+                    "[%s] sid=%s responses upstream failed: %s", self.log_prefix, session_id, exc
+                )
+                raise
 
         blocks, stop_reason = responses_output_to_blocks(response)
         self._last_content_blocks = blocks
@@ -564,13 +1060,77 @@ class BaseAdapter:
             except (AttributeError, TypeError):
                 pass
 
+        # Same TITO requirement as the chat path: the Responses API exposes no
+        # token-id field, so captured logprobs are always dropped here rather than
+        # paired with re-derived ids. Passing None keeps that explicit (and logged).
+        output_ids, output_log_probs = self._pair_logprobs_with_upstream_ids(
+            None, output_log_probs, session_id=session_id, mode="responses"
+        )
+
         finish = {
             "max_tokens": "length",
             "end_turn": "stop",
             "stop_sequence": "stop",
             "tool_use": "tool_calls",
         }.get(stop_reason, stop_reason or "stop")
-        return TurnRecord(prompt_ids=[], output_ids=[], finish_reason=finish, output_log_probs=output_log_probs)
+        return TurnRecord(
+            prompt_ids=[], output_ids=output_ids, finish_reason=finish, output_log_probs=output_log_probs
+        )
+
+    def _recover_text_tool_calls(
+        self, blocks: list[dict], tools_schema: list[dict] | None
+    ) -> list[dict]:
+        """Promote tool calls the upstream left as raw text into ``tool_use`` blocks.
+
+        An upstream that has no tool parser configured (or that does not recognise
+        the model's tool syntax) returns the call as literal text such as
+        ``<tool_call>read<arg_key>file_path</arg_key>...</tool_call>``. Downstream
+        that reads as an assistant message with no tool call at all, so the agent
+        loops asking for a file it never receives.
+
+        Only applied when the upstream returned NO structured ``tool_use`` block and
+        the text carries the marker, so a well-behaved upstream is untouched.
+        """
+        if not tools_schema or not blocks:
+            return blocks
+        if any(isinstance(b, dict) and b.get("type") == "tool_use" for b in blocks):
+            return blocks
+        if not any(
+            isinstance(b, dict) and b.get("type") == "text" and "<tool_call>" in (b.get("text") or "")
+            for b in blocks
+        ):
+            return blocks
+
+        from anyharness.parsing import parse_xml_tool_uses
+
+        out: list[dict] = []
+        recovered = 0
+        for b in blocks:
+            if not (isinstance(b, dict) and b.get("type") == "text"):
+                out.append(b)
+                continue
+            cleaned, tool_uses = parse_xml_tool_uses(b.get("text") or "", tools_schema)
+            if not tool_uses:
+                out.append(b)
+                continue
+            if cleaned.strip():
+                out.append({"type": "text", "text": cleaned})
+            for tu in tool_uses:
+                recovered += 1
+                out.append({
+                    "type": "tool_use",
+                    "id": f"toolu_{uuid.uuid4().hex[:16]}",
+                    "name": tu["name"],
+                    "input": tu.get("input") or {},
+                })
+        if recovered:
+            self.logger.info(
+                "[%s] recovered %d tool call(s) from raw upstream text "
+                "(upstream returned no structured tool_use)",
+                self.log_prefix,
+                recovered,
+            )
+        return out
 
     def _reply_from_content_blocks(
         self, blocks: list[dict], finish: str, tools_schema: list[dict] | None
@@ -587,6 +1147,7 @@ class BaseAdapter:
         """
         from .anthropic import _build_reply_parts_from_blocks  # local to avoid cycle
 
+        blocks = self._recover_text_tool_calls(blocks, tools_schema)
         manager_message, stop_reason = _build_reply_parts_from_blocks(blocks, finish)
         # manager_finish_reason: tool_calls if any tool_use present, else the raw finish
         has_tool_use = any(isinstance(b, dict) and b.get("type") == "tool_use" for b in blocks)
@@ -685,9 +1246,11 @@ class BaseAdapter:
         # messages mode carries no tokens (output_ids == []): the token-level
         # get_trajectory would return [] -- and it pops the per-sid tree while
         # doing so, leaving nothing for a message-level fallback to read. So in
-        # messages mode we branch to the message-level path BEFORE touching
-        # get_trajectory; the token path below is unchanged for sglang mode.
-        if self.upstream_mode in ("messages", "chat", "responses"):
+        # message_level backends (messages/chat/responses) carry no tokens
+        # (output_ids == []): the token-level get_trajectory would return [] and
+        # pop the per-sid tree while doing so, leaving nothing for a message-level
+        # fallback. Branch to the message-level path BEFORE touching get_trajectory.
+        if self.upstream.message_level:
             return self._finish_messages_session(
                 sid, base_sample=base_sample, reward=reward, extra_metadata=extra_metadata
             )
@@ -722,7 +1285,7 @@ class BaseAdapter:
         ``Sample`` objects (one per routing leaf). Lazily imported to avoid a
         circular import (``message_dump`` imports ``types`` only, but keeping
         the import local documents the fallback boundary)."""
-        from slime_sft_trace.message_dump import get_trajectory_messages
+        from anyharness.message_dump import get_trajectory_messages
 
         # Surface the tools_schema the model saw this session onto the dumped
         # Sample. tools_schema is keyed by sid on the adapter; node.metadata
@@ -829,7 +1392,12 @@ class BaseAdapter:
                 for k, v in request.headers.items()
                 if k.lower() in ("authorization", "x-api-key", "x-goog-api-key", "anthropic-version")
             }
-            turn = await self._call_upstream(prompt_ids, s, body, sid, translated=translated, tools_schema=tools_schema)
+            # messages-mode forwards the body verbatim, which is only valid when the
+            # downstream body is already Anthropic-shaped. Record the inbound wire
+            # format so _call_messages_upstream can translate when it is not.
+            self._downstream_format = downstream_format
+            result = await self._call_upstream(prompt_ids, s, body, sid, translated=translated, tools_schema=tools_schema)
+            turn = result.turn
 
             raw_output = (
                 tok.decode(turn.output_ids, skip_special_tokens=False)
@@ -841,15 +1409,15 @@ class BaseAdapter:
                 tool_parser_name=self.tool_parser,
                 reasoning_parser_name=self.reasoning_parser,
             )
-            # messages-mode / chat-mode: the upstream returned Anthropic-structured
-            # content blocks (tool_use/thinking/text), which parse_model_output
-            # CANNOT recover from decoded text. Build the manager_message directly
-            # from those blocks so tool_calls + reasoning_content survive into the
-            # trajectory (and thus the SFT dump). sglang mode has no blocks and
-            # falls through to the parsed reply (unchanged).
-            if self.upstream_mode in ("messages", "chat", "responses") and self._last_content_blocks:
-                reply = self._reply_from_content_blocks(self._last_content_blocks, turn.finish_reason, tools_schema)
-                self._last_content_blocks = []
+            # Block-level backends (messages/chat/responses) returned Anthropic-
+            # structured content blocks, which parse_model_output CANNOT recover
+            # from decoded text. Build the manager_message directly from those
+            # blocks so tool_calls + reasoning_content survive into the trajectory
+            # (and thus the SFT dump). Token-level backends (sglang/tinker) have no
+            # blocks and fall through to the parsed reply (unchanged). The branch is
+            # on the result shape, not on the upstream_mode string.
+            if result.content_blocks:
+                reply = self._reply_from_content_blocks(result.content_blocks, turn.finish_reason, tools_schema)
             else:
                 reply = self._build_reply(parsed, turn.finish_reason, translated, tools_schema)
             turn = dataclasses.replace(turn, ill_formed=parsed.ill_formed)
@@ -1042,6 +1610,190 @@ async def call_sglang_generate(
         finish_reason=finish,
         output_log_probs=output_log_probs,
     ), output_top_logprobs
+
+
+_tinker_mismatch_warned: set[str] = set()
+
+
+def _warn_if_tokenizer_mismatched(adapter: BaseAdapter, session_id: str | None) -> None:
+    """Warn once when the local tokenizer looks unrelated to the served model.
+
+    tinker mode renders the chat template locally, so a tokenizer from a different
+    model family silently produces a prompt the server never expects — the symptom
+    is the model echoing the prompt back rather than answering it, which is easy to
+    mistake for a bad checkpoint. Only a heuristic (the served name is free-form),
+    so this warns rather than raises.
+    """
+    served = os.environ.get("TINKER_BASE_MODEL") or ""
+    tok = getattr(adapter, "tokenizer", None)
+    local = str(getattr(tok, "name_or_path", "") or "")
+    if not served or not local:
+        return
+    key = f"{local}->{served}"
+    if key in _tinker_mismatch_warned:
+        return
+
+    def _family(name: str) -> str:
+        """Leading alphabetic run of the model name: Qwen3.6-35B-A3B -> "qwen"."""
+        leaf = name.rstrip("/").split("/")[-1].lower()
+        return "".join(itertools.takewhile(str.isalpha, leaf))
+
+    if _family(local) != _family(served):
+        _tinker_mismatch_warned.add(key)
+        adapter.logger.warning(
+            "[%s] sid=%s local tokenizer %r may not match served model %r; tinker "
+            "mode renders the chat template locally, so a mismatch yields prompts "
+            "the server misreads (often echoing the prompt back). Point MODEL_PATH "
+            "at the served model's tokenizer.",
+            adapter.log_prefix, session_id, local, served,
+        )
+
+
+def _tinker_sampling_params(session: Any, body: dict, *, adapter: BaseAdapter) -> dict:
+    """Translate our sampling dict to Tinker's SamplingParams.
+
+    Tinker accepts only ``max_tokens``/``temperature``/``top_k``/``top_p``/``stop``/
+    ``seed``; the sglang-specific detokenization knobs (``skip_special_tokens`` &c.)
+    are meaningless here because nothing is detokenized on the wire.
+    """
+    sp = _sampling_params(session, body, max_token_keys=adapter.max_token_keys, stop_keys=adapter.stop_keys)
+    out: dict[str, Any] = {"max_tokens": int(sp.get("max_new_tokens", 4096))}
+    for k in ("temperature", "top_p", "top_k", "stop", "seed"):
+        if sp.get(k) is not None:
+            out[k] = sp[k]
+    return out
+
+
+async def call_tinker_sample(
+    prompt_ids: list[int],
+    session: Any,
+    body: dict,
+    *,
+    adapter: BaseAdapter,
+    session_id: str | None = None,
+) -> TurnRecord:
+    """POST one turn to a Tinker/Mint ``/api/v1/asample`` and await its future.
+
+    Natively token-in token-out: ``prompt`` carries raw token ids and the reply's
+    ``sequences[0]`` returns ``tokens`` alongside an equal-length ``logprobs``, so
+    ids never round-trip through text and the TITO invariant holds by construction
+    (no ``return_token_ids``-style opt-in, no vocab lookups).
+
+    Two-step by design — ``asample`` returns ``{"request_id": ...}`` and the result
+    is collected from ``/api/v1/retrieve_future``. Module-level (not a method) so
+    tests can monkeypatch it, matching :func:`call_sglang_generate`.
+    """
+    logger = adapter.logger
+    base = (os.environ.get("TINKER_BASE_URL") or "").rstrip("/")
+    api_key = os.environ.get("TINKER_API_KEY") or ""
+    sp = _tinker_sampling_params(session, body, adapter=adapter)
+    _warn_if_tokenizer_mismatched(adapter, session_id)
+
+    if session.max_context_tokens > 0:
+        remaining_context = session.max_context_tokens - len(prompt_ids)
+        if remaining_context <= 0:
+            logger.warning(
+                "[%s] sid=%s prompt exceeds max_context_tokens (%d >= %d)",
+                adapter.log_prefix, session_id, len(prompt_ids), session.max_context_tokens,
+            )
+            return TurnRecord(prompt_ids=list(prompt_ids), output_ids=[], finish_reason="length"), None
+        sp["max_tokens"] = min(int(sp.get("max_tokens", remaining_context)), remaining_context)
+
+    payload: dict[str, Any] = {
+        "num_samples": 1,
+        "prompt": {"chunks": [{"type": "encoded_text", "tokens": list(prompt_ids)}]},
+        "sampling_params": sp,
+    }
+    # model_id selects a specific training step; base_model uses the served base.
+    if os.environ.get("TINKER_MODEL_ID"):
+        payload["model_id"] = os.environ["TINKER_MODEL_ID"]
+    else:
+        payload["base_model"] = os.environ.get("TINKER_BASE_MODEL") or ""
+    # Verified against a live Mint gateway: prompt_logprobs also gates the
+    # *sampled* logprobs — with it false, sequences[].logprobs comes back empty.
+    # Since token-level logprobs are the whole reason to use this mode, default
+    # it on; TINKER_LOGPROBS=0 opts out for message-level-only runs.
+    if os.environ.get("TINKER_LOGPROBS", "1") != "0":
+        payload.update(prompt_logprobs=True, include_prompt_logprobs=True)
+
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    timeout = aiohttp.ClientTimeout(total=None, sock_read=900)
+
+    async with aiohttp.ClientSession(timeout=timeout) as sess:
+        async with sess.post(f"{base}/api/v1/asample", json=payload, headers=headers) as r:
+            if r.status >= 400:
+                text = await r.text()
+                logger.warning(
+                    "[%s] sid=%s tinker asample %d: %.200s", adapter.log_prefix, session_id, r.status, text
+                )
+                raise RuntimeError(f"tinker asample {r.status}: {text[:400]}")
+            submit = await r.json(content_type=None)
+        request_id = submit.get("request_id")
+        if not request_id:
+            raise RuntimeError(f"tinker asample returned no request_id: {str(submit)[:200]}")
+
+        data = await _tinker_retrieve_future(
+            sess, base, headers, request_id, adapter=adapter, session_id=session_id
+        )
+
+    seqs = data.get("sequences") or []
+    if not seqs:
+        raise RuntimeError(f"tinker future had no sequences: {str(data)[:200]}")
+    seq = seqs[0]
+    output_ids = [int(t) for t in (seq.get("tokens") or [])]
+    output_log_probs = [float(x) for x in (seq.get("logprobs") or [])]
+    # The server pairs these itself; a mismatch means a shape change we should not
+    # paper over, since record_turn asserts on it and training would consume it.
+    if output_log_probs and len(output_log_probs) != len(output_ids):
+        logger.warning(
+            "[%s] sid=%s tinker tokens (%d) != logprobs (%d); dropping logprobs",
+            adapter.log_prefix, session_id, len(output_ids), len(output_log_probs),
+        )
+        output_log_probs = []
+    finish = {"length": "length", "stop": "stop", "abort": "abort"}.get(
+        seq.get("stop_reason") or "stop", seq.get("stop_reason") or "stop"
+    )
+    return TurnRecord(
+        prompt_ids=list(prompt_ids),
+        output_ids=output_ids,
+        finish_reason=finish,
+        output_log_probs=output_log_probs,
+    ), None
+
+
+async def _tinker_retrieve_future(
+    sess: aiohttp.ClientSession,
+    base: str,
+    headers: dict,
+    request_id: str,
+    *,
+    adapter: BaseAdapter,
+    session_id: str | None,
+) -> dict:
+    """Poll ``/api/v1/retrieve_future`` until the sample result materialises.
+
+    The endpoint returns the completed payload directly; a reply without
+    ``sequences`` means "not ready yet", so back off and retry until the deadline.
+    """
+    poll_timeout = float(os.environ.get("TINKER_FUTURE_TIMEOUT", "900") or "900")
+    delay, waited = 0.5, 0.0
+    while True:
+        async with sess.post(
+            f"{base}/api/v1/retrieve_future", json={"request_id": request_id}, headers=headers
+        ) as r:
+            if r.status >= 400:
+                text = await r.text()
+                raise RuntimeError(f"tinker retrieve_future {r.status}: {text[:400]}")
+            data = await r.json(content_type=None)
+        if data.get("sequences"):
+            return data
+        if waited >= poll_timeout:
+            raise RuntimeError(f"tinker future {request_id} not ready after {poll_timeout}s")
+        await asyncio.sleep(delay)
+        waited += delay
+        delay = min(delay * 1.5, 5.0)  # ramp down polling pressure on long generations
 
 
 def _parse_messages_json(data: dict) -> tuple[str, str, int, list[dict]]:

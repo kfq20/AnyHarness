@@ -1,7 +1,7 @@
-"""slime_sft_trace — AnyHarness.
+"""anyharness — AnyHarness.
 
 AnyHarness is the layer between a harness (Claude Code) and the sampling endpoint /
-API server: the :class:`~slime_sft_trace.adapters.AnthropicAdapter` exposes
+API server: the :class:`~anyharness.adapters.AnthropicAdapter` exposes
 ``/v1/messages`` downstream to the harness, forwards upstream to a pluggable
 backend (sglang with per-token logprobs, or any messages-API), and captures
 each turn into a per-session trajectory tree that an offline aggregator dumps

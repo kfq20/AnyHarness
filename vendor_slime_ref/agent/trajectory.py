@@ -15,7 +15,7 @@ import logging
 from collections.abc import Iterator
 from typing import Any
 
-from .types import Sample
+from slime.utils.types import Sample
 
 logger = logging.getLogger(__name__)
 

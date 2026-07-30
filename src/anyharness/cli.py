@@ -16,6 +16,16 @@ Upstream mode is chosen by env ``UPSTREAM_MODE``:
   Needs ``MODEL_PATH`` (HF tokenizer) + ``SLIME_SGLANG_URL``.
 * ``messages``: adapter forwards to an arbitrary ``/v1/messages`` API upstream.
   Needs ``SLIME_MESSAGES_UPSTREAM_URL``; tokenizer is None.
+* ``chat``: adapter forwards to any OpenAI-compatible endpoint via litellm.
+  Needs ``SLIME_CHAT_BASE_URL``. ``SLIME_CHAT_LOGPROBS=1`` captures per-token
+  logprobs, which needs a vLLM >= 0.10.2 upstream (``return_token_ids``) to
+  supply the sampled token ids, plus ``MODEL_PATH``.
+* ``responses``: same via the OpenAI Responses API. Needs
+  ``SLIME_RESPONSES_BASE_URL``. Cannot capture logprobs (no token ids in that API).
+* ``tinker``: native token-in token-out against a Tinker/Mint-style
+  ``/api/v1/asample``; token ids and matching logprobs both come straight from
+  the server. Needs ``MODEL_PATH`` + ``TINKER_BASE_URL`` and one of
+  ``TINKER_MODEL_ID`` / ``TINKER_BASE_MODEL``.
 
 Sandbox: ``LocalSandbox`` by default; env ``SANDBOX=e2b`` switches to
 :class:`E2BSandbox` for real (networked) tasks.
@@ -34,7 +44,7 @@ from .dump import dump_samples
 from .harness import ClaudeCodeHarness, LocalSandbox
 from .harness.claude_code import E2BSandbox
 
-logger = logging.getLogger("slime_sft_trace.cli")
+logger = logging.getLogger("anyharness.cli")
 
 
 # ===========================================================================
@@ -47,8 +57,11 @@ class Config:
 
     def __init__(self) -> None:
         self.upstream_mode = os.environ.get("UPSTREAM_MODE", "sglang").strip().lower()
-        if self.upstream_mode not in ("sglang", "messages", "chat", "responses"):
-            raise ValueError(f"UPSTREAM_MODE must be 'sglang', 'messages', 'chat', or 'responses', got {self.upstream_mode!r}")
+        if self.upstream_mode not in ("sglang", "messages", "chat", "responses", "tinker"):
+            raise ValueError(
+                "UPSTREAM_MODE must be 'sglang', 'messages', 'chat', 'responses', or "
+                f"'tinker', got {self.upstream_mode!r}"
+            )
 
         self.model_path = os.environ.get("MODEL_PATH") or None
         self.sglang_url = os.environ.get("SLIME_SGLANG_URL") or None
@@ -77,9 +90,35 @@ class Config:
         elif self.upstream_mode == "responses":
             if not os.environ.get("SLIME_RESPONSES_BASE_URL"):
                 raise ValueError("SLIME_RESPONSES_BASE_URL is required in responses mode")
+        elif self.upstream_mode == "tinker":
+            # tinker renders the chat template locally and sends token ids, so the
+            # tokenizer is as load-bearing here as in sglang mode.
+            if not self.model_path:
+                raise ValueError("MODEL_PATH is required in tinker mode (HF tokenizer path)")
+            if not os.environ.get("TINKER_BASE_URL"):
+                raise ValueError("TINKER_BASE_URL is required in tinker mode")
+            if not (os.environ.get("TINKER_MODEL_ID") or os.environ.get("TINKER_BASE_MODEL")):
+                raise ValueError(
+                    "tinker mode needs TINKER_MODEL_ID (a specific training step) or "
+                    "TINKER_BASE_MODEL (the served base model)"
+                )
         else:  # chat
             if not os.environ.get("SLIME_CHAT_BASE_URL"):
                 raise ValueError("SLIME_CHAT_BASE_URL is required in chat mode")
+        # chat mode gets token ids from the upstream (vLLM return_token_ids); without
+        # a tokenizer we cannot even render, and logprobs would be silently dropped —
+        # a bad surprise to discover after a training run, so fail fast instead.
+        if self.upstream_mode == "chat" and os.environ.get("SLIME_CHAT_LOGPROBS") == "1" and not self.model_path:
+            raise ValueError(
+                "chat mode with SLIME_CHAT_LOGPROBS=1 requires MODEL_PATH; unset it "
+                "for message-level SFT only"
+            )
+        if self.upstream_mode == "responses" and os.environ.get("SLIME_RESPONSES_LOGPROBS") == "1":
+            raise ValueError(
+                "responses mode cannot capture logprobs token-in-token-out: the "
+                "Responses API exposes no token ids. Use UPSTREAM_MODE=tinker or "
+                "sglang for token-level data, or unset SLIME_RESPONSES_LOGPROBS"
+            )
         if not self.prompt:
             raise ValueError("PROMPT env var is required")
 
@@ -169,12 +208,21 @@ class AdapterServer:
 
 
 def load_tokenizer(cfg: Config):
-    """Load the HF tokenizer for sglang mode; None in messages mode."""
-    if cfg.upstream_mode != "sglang":
-        return None
-    from transformers import AutoTokenizer
+    """Load the HF tokenizer when one is needed (or usable).
 
-    return AutoTokenizer.from_pretrained(cfg.model_path, trust_remote_code=True)
+    Required in sglang and tinker modes, which render the chat template locally
+    and speak token ids on the wire. Optional in chat/responses mode (those get
+    token ids from the upstream, not from us). messages mode never needs one.
+    """
+    if cfg.upstream_mode in ("sglang", "tinker"):
+        from transformers import AutoTokenizer
+
+        return AutoTokenizer.from_pretrained(cfg.model_path, trust_remote_code=True)
+    if cfg.upstream_mode in ("chat", "responses") and cfg.model_path:
+        from transformers import AutoTokenizer
+
+        return AutoTokenizer.from_pretrained(cfg.model_path, trust_remote_code=True)
+    return None
 
 
 def build_adapter(cfg: Config, tokenizer: Any) -> Any:
@@ -188,7 +236,7 @@ def build_adapter(cfg: Config, tokenizer: Any) -> Any:
     so we pass the same kwargs in both modes — ``sglang_url`` is required by the
     signature but unused in messages mode (None is tolerated).
     """
-    from slime_sft_trace.adapters import AnthropicAdapter
+    from anyharness.adapters import AnthropicAdapter
 
     return AnthropicAdapter(
         tokenizer=tokenizer,
@@ -213,7 +261,7 @@ async def run_once(cfg: Config, *, session_id: str | None = None) -> list:
     environment as ``ADAPTER_AUTH`` so a custom claude binary can echo it back as
     the Authorization Bearer token.
     """
-    from slime_sft_trace import Sample  # vendored by the parallel agent
+    from anyharness import Sample  # vendored by the parallel agent
 
     tokenizer = load_tokenizer(cfg)
     adapter = build_adapter(cfg, tokenizer)

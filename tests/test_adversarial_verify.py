@@ -10,12 +10,12 @@ from __future__ import annotations
 
 import pytest
 
-from slime_sft_trace import Sample, TrajectoryManager, TurnRecord
-from slime_sft_trace.message_dump import (
+from anyharness import Sample, TrajectoryManager, TurnRecord
+from anyharness.message_dump import (
     anthropic_wire_to_sft,
     get_trajectory_messages,
 )
-from slime_sft_trace.dump import _sample_to_sft_record, dump_samples_sft
+from anyharness.dump import _sample_to_sft_record, dump_samples_sft
 
 
 def _msg_turn(*, finish="stop"):

@@ -10,12 +10,16 @@ import socket
 import threading
 import time
 
-PROJ = "/root/.claude/jobs/203771d4/tmp/slime-sft-trace"
+PROJ = "/root/agent-model/hcp-work/AnyHarness"
 sys.path.insert(0, PROJ + "/src")
 
-MINTCN_KEY = "REDACTED_MINTCN_KEY"
-MINTCN_URL = "https://mintcn.macaron.xin"
-MODEL = "macaron-v1-coding-venti"
+# Credentials come from the environment, never hardcoded. This script is a
+# manual live-network check (run with `python tests/test_smolagents_anyharness.py`),
+# not collected by pytest. A missing key makes it refuse to run at __main__ rather
+# than leak a secret into the repo.
+MINTCN_KEY = os.environ.get("SLIME_CHAT_API_KEY", "")
+MINTCN_URL = os.environ.get("SLIME_CHAT_BASE_URL", "https://mintcn.macaron.xin")
+MODEL = os.environ.get("SLIME_CHAT_MODEL", "macaron-v1-coding-venti")
 
 
 def free_port():
@@ -25,7 +29,7 @@ def free_port():
 def start_adapter_in_thread(port, sid):
     """Start the AnyHarness aiohttp server in a background event loop thread."""
     from aiohttp import web
-    from slime_sft_trace.adapters import AnthropicAdapter
+    from anyharness.adapters import AnthropicAdapter
 
     os.environ.update(
         UPSTREAM_MODE="chat",
@@ -70,6 +74,11 @@ def start_adapter_in_thread(port, sid):
 
 
 if __name__ == "__main__":
+    if not MINTCN_KEY:
+        raise SystemExit(
+            "set SLIME_CHAT_API_KEY (and optionally SLIME_CHAT_BASE_URL/SLIME_CHAT_MODEL) "
+            "to run this live smolagents integration check"
+        )
     port = free_port()
     sid = "smolagents-anyharness"
     stop_server, adapter, loop = start_adapter_in_thread(port, sid)
@@ -88,7 +97,7 @@ if __name__ == "__main__":
         result = agent.run("What is 2+2? Reply with just the number.")
         print(f"AGENT RESULT: {result}  time={time.time()-t0:.1f}s")
 
-        from slime_sft_trace import Sample
+        from anyharness import Sample
         fut = asyncio.run_coroutine_threadsafe(
             adapter.finish_session(sid, base_sample=Sample(index=0), reward=0.0),
             loop

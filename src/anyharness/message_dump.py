@@ -7,7 +7,7 @@ This module mirrors that leaf-walk but linearizes each leaf chain into a
 routing leaf whose ``prompt`` IS the full OpenAI/HF messages conversation.
 
 The conversion from Anthropic content-blocks to OpenAI messages reuses the
-pure-function logic from :mod:`slime_sft_trace.adapters.anthropic`
+pure-function logic from :mod:`anyharness.adapters.anthropic`
 (:func:`_translate_messages` + :func:`_tools_to_chat_tools`), copied here to
 avoid a circular import (``adapters`` imports ``trajectory``, which this module
 augments). The tree itself is left untouched: ``record_turn`` already built it,
@@ -47,7 +47,7 @@ from .types import Sample
 def _flatten_content(c: Any) -> str:
     """Flatten a wire content value (Anthropic or OpenAI blocks) to a string.
 
-    Mirrors :func:`slime_sft_trace.adapters.common.flatten_content` for the
+    Mirrors :func:`anyharness.adapters.common.flatten_content` for the
     assistant-text extraction path. Multiple blocks are joined with ``"\\n\\n"``
     (GAP B: matches the production GLM-5.2 converter's
     :func:`export_covered_claude_events_to_glm52_sft.content_part_to_text`, which
@@ -116,7 +116,7 @@ def anthropic_wire_to_sft(
     SFT messages (+ tools schema).
 
     Rules (faithful copy of
-    :func:`slime_sft_trace.adapters.anthropic._translate_messages` +
+    :func:`anyharness.adapters.anthropic._translate_messages` +
     :func:`_tools_to_chat_tools`):
 
     * ``system`` (top-level or role) -> ``{"role":"system","content":str}``.
@@ -243,7 +243,7 @@ def _tools_to_chat_tools(anth_tools: list[dict] | None) -> list[dict] | None:
     schema defaults to ``{"type":"object","additionalProperties":True}``
     (GAP C: matches :func:`export_covered_claude_events_to_glm52_sft.anthropic_tool_to_glm52_def`,
     i.e. what the model saw at rollout). Faithful copy of
-    :func:`slime_sft_trace.adapters.anthropic._tools_to_chat_tools` modulo the
+    :func:`anyharness.adapters.anthropic._tools_to_chat_tools` modulo the
     default-schema alignment.
     """
     if not anth_tools:

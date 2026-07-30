@@ -19,14 +19,14 @@ import json
 import pytest
 
 try:
-    from slime_sft_trace import Sample, TrajectoryManager, TurnRecord
-    from slime_sft_trace.message_dump import (
+    from anyharness import Sample, TrajectoryManager, TurnRecord
+    from anyharness.message_dump import (
         anthropic_wire_to_sft,
         get_trajectory_messages,
     )
 except Exception as exc:  # pragma: no cover - depends on vendored layer
     pytest.skip(
-        f"slime_sft_trace message_dump not importable: {exc!r}",
+        f"anyharness message_dump not importable: {exc!r}",
         allow_module_level=True,
     )
 
@@ -303,7 +303,7 @@ def test_finish_session_messages_mode_dumps_message_samples():
     import asyncio
     import os
 
-    from slime_sft_trace.adapters.anthropic import AnthropicAdapter
+    from anyharness.adapters.anthropic import AnthropicAdapter
 
     os.environ["UPSTREAM_MODE"] = "messages"
     os.environ.setdefault("SLIME_MESSAGES_UPSTREAM_URL", "http://127.0.0.1:9")
@@ -354,7 +354,7 @@ def test_tools_propagate_from_record_turn_metadata():
     import json
     import tempfile
 
-    from slime_sft_trace.dump import dump_samples_sft
+    from anyharness.dump import dump_samples_sft
 
     mgr = TrajectoryManager()
     sid = "tools-1"
@@ -698,7 +698,7 @@ def test_anthropic_tool_result_carries_name_paired_by_original_id():
     that produced it (from the preceding assistant tool_use), paired by the
     original Anthropic toolu_ id -- mirrors
     export_covered_claude_events_to_glm52.anthropic_request_messages_to_glm52."""
-    from slime_sft_trace.message_dump import _pair_tool_call_ids
+    from anyharness.message_dump import _pair_tool_call_ids
 
     msgs = [
         {"role": "user", "content": "plan a trip"},
@@ -846,7 +846,7 @@ def _tool_call_sample():
 
 
 def test_glm52_flavor_keeps_dict_arguments(tmp_path):
-    from slime_sft_trace.dump import dump_samples_sft
+    from anyharness.dump import dump_samples_sft
 
     s = _tool_call_sample()
     dump_samples_sft([s], tmp_path, flavor="glm52")
@@ -864,7 +864,7 @@ def test_glm52_flavor_keeps_dict_arguments(tmp_path):
 
 
 def test_openai_wire_flavor_stringifies_arguments_and_sets_meta_format(tmp_path):
-    from slime_sft_trace.dump import dump_samples_sft
+    from anyharness.dump import dump_samples_sft
 
     s = _tool_call_sample()
     dump_samples_sft([s], tmp_path, flavor="openai_wire")
@@ -885,7 +885,7 @@ def test_openai_wire_flavor_stringifies_arguments_and_sets_meta_format(tmp_path)
 def test_glm52_and_openai_wire_flavors_both_load_via_json(tmp_path):
     """Both flavors round-trip through json.loads and the openai_wire arguments
     decode back to the original dict (datasets<4.7 would json.loads it)."""
-    from slime_sft_trace.dump import dump_samples_sft
+    from anyharness.dump import dump_samples_sft
 
     s = _tool_call_sample()
     dump_samples_sft([s], tmp_path, flavor="glm52")
@@ -915,7 +915,7 @@ def test_openai_wire_stringify_mirrors_production_converter(tmp_path):
     """The openai_wire flavor must match the production converter's
     stringify_tool_arguments output byte-for-byte (format marker + JSON
     stringification with ensure_ascii=False). Regression for drift."""
-    from slime_sft_trace.dump import _stringify_tool_arguments, _sample_to_sft_record
+    from anyharness.dump import _stringify_tool_arguments, _sample_to_sft_record
 
     s = _tool_call_sample()
     base = _sample_to_sft_record(s)
@@ -937,7 +937,7 @@ def test_openai_wire_stringify_mirrors_production_converter(tmp_path):
 def test_default_flavor_is_glm52(tmp_path):
     """dump_samples_sft without an explicit flavor writes the glm52 file with
     dict arguments (backward-compatible default for existing callers)."""
-    from slime_sft_trace.dump import dump_samples_sft
+    from anyharness.dump import dump_samples_sft
 
     s = _tool_call_sample()
     dump_samples_sft([s], tmp_path)  # no flavor kwarg
@@ -955,7 +955,7 @@ def test_build_reply_preserves_non_standard_block_types():
     """_build_reply_parts_from_blocks must not silently drop code / reasoning /
     redacted_thinking / unknown blocks — they fall back to text (matching the
     production converter's content_part_to_text)."""
-    from slime_sft_trace.adapters.anthropic import _build_reply_parts_from_blocks
+    from anyharness.adapters.anthropic import _build_reply_parts_from_blocks
 
     mm, stop = _build_reply_parts_from_blocks(
         [
@@ -978,7 +978,7 @@ def test_build_reply_preserves_non_standard_block_types():
 def test_multiblock_prompt_joined_with_double_newline():
     """flatten_content joins multi-block text with \\n\\n (production parity),
     so a multi-block system prompt tokenizes like production SFT data."""
-    from slime_sft_trace.adapters.common import flatten_content
+    from anyharness.adapters.common import flatten_content
 
     joined = flatten_content([{"type": "text", "text": "line one"}, {"type": "text", "text": "line two"}])
     assert joined == "line one\n\nline two"
@@ -989,7 +989,7 @@ def test_tool_result_blanked_does_not_fork():
     NOT fork: the blanked replay must match the stored real-content tool node,
     and the real content must survive into the SFT dump (ToolMessage excludes
     content from == but keeps it for subscript/json)."""
-    from slime_sft_trace.adapters.anthropic import _translate_messages
+    from anyharness.adapters.anthropic import _translate_messages
 
     mgr = TrajectoryManager()
     sid = "blank"
@@ -1030,7 +1030,7 @@ def test_tool_result_blanked_does_not_fork():
 def test_chat_response_to_blocks_tool_call_dict_args():
     """litellm emits tool_calls.arguments as a JSON STRING; chat_response_to_blocks
     must normalize to a dict (the tree/dump shape) and emit tool_use blocks."""
-    from slime_sft_trace.adapters.anthropic import chat_response_to_blocks
+    from anyharness.adapters.anthropic import chat_response_to_blocks
 
     class _Fn:
         name = "Read"
@@ -1067,7 +1067,7 @@ def test_stringify_tool_call_args_serializes_dict_for_wire():
     """_stringify_tool_call_args turns dict arguments into a JSON string for the
     chat upstream (some endpoints reject dict args in replayed history), without
     touching the original messages."""
-    from slime_sft_trace.adapters.common import _stringify_tool_call_args
+    from anyharness.adapters.common import _stringify_tool_call_args
 
     original = [
         {"role": "system", "content": "s"},
