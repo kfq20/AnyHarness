@@ -6,30 +6,31 @@ Build SFT training trajectories from a coding agent's `/v1/messages` traffic.
 between a harness (Claude Code) and the sampling endpoint / API server. It
 manages the harness↔upstream contract: the adapter exposes `/v1/messages`
 downstream to Claude Code, forwards upstream to a pluggable backend
-(sglang with per-token logprobs, or any messages-API), and captures each turn
-into a trajectory tree that an offline aggregator dumps as SFT data. The
-"harness in the loop" is that the adapter sits *between* the harness and the
-model — it is not fire-and-forget: every `/v1/messages` call is intercepted,
-matched into a per-session tree (tolerant of Claude Code's tool-result
-trimming), and linearized into training samples at `finish_session`.
+(sglang, vLLM `/v1/completions`, or any messages/chat/responses API), and
+captures each turn into a trajectory tree that an offline aggregator dumps as
+SFT data. The "harness in the loop" is that the adapter sits *between* the
+harness and the model — it is not fire-and-forget: every `/v1/messages` call is
+intercepted, matched into a per-session tree (tolerant of Claude Code's
+tool-result trimming), and linearized into training samples at `finish_session`.
 
-This standalone project reuses Slime's agent code (trajectory manager, types,
-and the Anthropic Messages adapter) and adds a sandbox-pluggable Claude Code
-harness + CLI that drives the agent through the adapter and dumps loss-masked
-SFT samples.
+A standalone adapter + sandbox-pluggable Claude Code harness + CLI that drives
+the agent through the adapter and dumps loss-masked SFT samples.
 
 ## Layout
 
 ```
 src/anyharness/
-  trajectory.py        # TrajectoryManager, TurnRecord (vendored)
-  types.py             # Sample (vendored)
-  parsing.py            # parse_model_output (vendored)
-  adapters/             # AnthropicAdapter: /v1/messages, sglang|messages upstream (vendored)
+  trajectory.py        # TrajectoryManager, TurnRecord, SampledSequence, TopkLogprobs
+  types.py             # Sample
+  parsing.py            # parse_model_output (reasoning + tool-call parsers)
+  adapters/             # AnthropicAdapter: /v1/messages downstream + 5 upstreams
+                         #   (sglang /generate, vLLM /v1/completions, vLLM chat,
+                         #    Responses, Tinker asample)
   harness/
     claude_code.py      # ClaudeCodeHarness + Sandbox/LocalSandbox/E2BSandbox
   cli.py                # main(): adapter-in-thread -> harness -> finish_session -> dump
   dump.py               # dump_samples -> trajectories.jsonl + .md (+ .pt)
+  sharegpt_dump.py     # fold a tree into ShareGPT (reasoning + thinking_signature)
 ```
 
 ## How it works
@@ -63,10 +64,25 @@ sglang mode (capture logprobs from a served model):
 
 ```bash
 export UPSTREAM_MODE=sglang
-export MODEL_PATH=Qwen/Qwen2.5-Coder-7B-Instruct
+export MODEL_PATH=Qwen/Qwen3.5-9B
 export SLIME_SGLANG_URL=http://localhost:30000
 export PROMPT="Fix the failing test in tests/test_foo.py"
 export OUTPUT_DIR=./out
+anyharness
+```
+
+completions mode (vLLM `/v1/completions`, native token-in token-out — the
+cleanest path for vLLM, no chat-shape workarounds):
+
+```bash
+export UPSTREAM_MODE=completions
+export SLIME_COMPLETIONS_BASE_URL=http://localhost:30001   # vLLM OpenAI server
+export SLIME_COMPLETIONS_MODEL=qwen3-9b
+export SLIME_COMPLETIONS_LOGPROBS=1                        # capture per-token logprobs
+export SLIME_COMPLETIONS_TOP_LOGPROBS=5                    # top-k alternatives
+export MODEL_PATH=Qwen/Qwen3.5-9B                          # tokenizer (optional if
+                                                            #  the server exposes /tokenize)
+export PROMPT="..."
 anyharness
 ```
 
@@ -103,6 +119,7 @@ emitted. Where each mode stands:
 | Mode | Token ids from | Logprobs |
 |------|----------------|----------|
 | `tinker` | ids in, ids out (`/api/v1/asample`) | yes, paired by the server |
+| `completions` | vLLM `choice.token_ids` (`/v1/completions`) | yes — ids + logprobs from one response |
 | `sglang` | native `/generate` (`meta_info`) | yes |
 | `chat` | upstream `return_token_ids` (vLLM >= 0.10.2) | only if the upstream supplies ids |
 | `responses` | not available | no — the Responses API exposes no ids |
@@ -146,16 +163,25 @@ where we send token ids rather than messages. It is not implemented.
 
 | Var | Default | Meaning |
 |-----|---------|---------|
-| `UPSTREAM_MODE` | `sglang` | `sglang`, `tinker`, `chat`, `responses`, or `messages` |
-| `MODEL_PATH` | — | HF tokenizer path (required in sglang/tinker mode) |
+| `UPSTREAM_MODE` | `sglang` | `sglang`, `completions`, `tinker`, `chat`, `responses`, or `messages` |
+| `MODEL_PATH` | — | HF tokenizer path (required in sglang/tinker; optional elsewhere) |
+| `SLIME_SGLANG_URL` | — | sglang base URL (sglang mode) |
+| `SLIME_COMPLETIONS_BASE_URL` | — | vLLM OpenAI server base URL (completions mode) |
+| `SLIME_COMPLETIONS_MODEL` | — | served model name (completions mode) |
+| `SLIME_COMPLETIONS_API_KEY` | — | Bearer token for the completions upstream |
+| `SLIME_COMPLETIONS_LOGPROBS` | `0` | `1` captures per-token logprobs |
+| `SLIME_COMPLETIONS_TOP_LOGPROBS` | `0` | top-k alternatives per position |
+| `SLIME_CHAT_BASE_URL` | — | OpenAI-compatible base URL (chat mode) |
+| `SLIME_CHAT_MODEL` | — | served model name (chat mode) |
+| `SLIME_CHAT_LOGPROBS` | `0` | `1` captures logprobs (needs vLLM `return_token_ids`) |
+| `SLIME_RESPONSES_BASE_URL` | — | Responses API base URL (responses mode) |
+| `SLIME_MESSAGES_UPSTREAM_URL` | — | upstream `/v1/messages` URL (messages mode) |
 | `TINKER_BASE_URL` | — | Tinker/Mint gateway base URL (tinker mode) |
 | `TINKER_API_KEY` | — | Bearer token for the gateway |
 | `TINKER_BASE_MODEL` | — | served base model, e.g. `Qwen/Qwen3.6-35B-A3B` |
 | `TINKER_MODEL_ID` | — | a specific training step instead of the base model |
 | `TINKER_LOGPROBS` | `1` | `0` disables logprob capture (it also gates prompt logprobs) |
 | `TINKER_FUTURE_TIMEOUT` | `900` | seconds to await `/retrieve_future` |
-| `SLIME_SGLANG_URL` | — | sglang base URL (sglang mode) |
-| `SLIME_MESSAGES_UPSTREAM_URL` | — | upstream `/v1/messages` URL (messages mode) |
 | `ADAPTER_PORT` | `18080` | port the adapter listens on |
 | `CLAUDE_MODEL` | `slime-actor` | model name advertised to the CLI |
 | `PROMPT` | — | the task prompt (required) |
@@ -172,6 +198,6 @@ where we send token ids rather than messages. It is not implemented.
 pytest tests/test_harness_smoke.py
 ```
 
-The smoke test exercises the vendored trajectory layer end to end (no model,
-sglang, or claude binary): it builds a `TrajectoryManager`, feeds hand-built
-turns, and asserts loss masks (prompt=0, response=1).
+The smoke test exercises the trajectory layer end to end (no model, sglang, or
+claude binary): it builds a `TrajectoryManager`, feeds hand-built turns, and
+asserts loss masks (prompt=0, response=1).
