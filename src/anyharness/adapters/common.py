@@ -168,6 +168,27 @@ class ChatUpstream(_DelegatingUpstream):
 
     async def sample(self, messages, tools_schema, body, session, session_id):
         self._a._last_usage = None
+        # The Responses API uses FLAT tool shape ({type:function, name, parameters});
+        # the chat upstream (litellm/vLLM) needs NESTED ({type:function,
+        # function:{name,parameters}}). Normalize once here so both paths match.
+        tools_schema = _nest_tools(tools_schema)
+        # litellm 1.88 rejects the standard tool_calls[].type="function" shape on
+        # vLLM 0.26 (expects a non-standard CustomToolCallParam). Route any request
+        # that replays a tool_call through plain HTTP, bypassing the validator.
+        has_tool_replay = any(
+            isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls")
+            for m in messages
+        )
+        if has_tool_replay:
+            raw = await self._a._call_chat_upstream_raw(messages, tools_schema, body, session_id)
+            from anyharness.trajectory import SampledSequence, TurnRecord
+            turn = TurnRecord(
+                prompt_ids=[],
+                output_ids=raw["output_ids"],
+                finish_reason=raw["stop_reason"],
+                output_log_probs=raw["output_log_probs"],
+            )
+            return SamplingResult(turn=turn, content_blocks=raw["blocks"], usage=raw["usage"])
         turn = await self._a._call_chat_upstream(messages, tools_schema, body, session_id)
         return SamplingResult(turn=turn, content_blocks=self._a._last_content_blocks,
                                usage=self._a._last_usage)
@@ -231,8 +252,34 @@ def _render_token_ids(
     add_generation_prompt: bool = True,
 ) -> list[int]:
     """Render a chat-message list to token ids with the served chat template."""
+    # Chat templates call .items() on tool_call arguments, so a JSON *string*
+    # (the OpenAI wire shape some harnesses replay) breaks rendering. Normalize
+    # string arguments to dicts for the template; the tree is untouched.
+    renderable = messages
+    if any(isinstance(m, dict) and m.get("tool_calls") for m in messages):
+        renderable = []
+        for m in messages:
+            if not (isinstance(m, dict) and isinstance(m.get("tool_calls"), list)):
+                renderable.append(m)
+                continue
+            m2 = dict(m)
+            m2["tool_calls"] = []
+            for tc in m["tool_calls"]:
+                tc2 = tc if isinstance(tc, dict) else tc
+                if isinstance(tc2, dict):
+                    tc2 = dict(tc2)
+                    fn = tc2.get("function")
+                    if isinstance(fn, dict) and isinstance(fn.get("arguments"), str):
+                        fn = dict(fn)
+                        try:
+                            fn["arguments"] = json.loads(fn["arguments"] or "{}")
+                        except json.JSONDecodeError:
+                            fn["arguments"] = {"_raw": fn["arguments"]}
+                        tc2["function"] = fn
+                m2["tool_calls"].append(tc2)
+            renderable.append(m2)
     enc = tokenizer.apply_chat_template(
-        messages,
+        renderable,
         tools=tools,
         tokenize=True,
         add_generation_prompt=add_generation_prompt,
@@ -336,6 +383,76 @@ def _stringify_tool_call_args(messages: list[dict]) -> list[dict]:
                 tcs.append(tc)
         m2["tool_calls"] = tcs
         out.append(m2)
+    return out
+
+
+def _nest_tools(tools: list[dict] | None) -> list[dict] | None:
+    """Wrap flat Responses-API tools ({type,name,parameters}) into the nested
+    chat-completions shape ({type,function:{name,parameters}}) the chat upstream
+    (litellm/vLLM) requires. Already-nested tools pass through unchanged."""
+    if not tools:
+        return tools
+    out = []
+    for t in tools:
+        if not isinstance(t, dict):
+            continue
+        if "function" in t:
+            out.append(t)
+            continue
+        if t.get("type") == "function" and t.get("name"):
+            out.append({"type": "function", "function": {
+                "name": t["name"],
+                "description": t.get("description", ""),
+                "parameters": t.get("parameters") or t.get("input_schema") or {"type": "object", "properties": {}},
+            }})
+        else:
+            out.append(t)
+    return out or None
+
+
+def _ensure_tool_call_ids(messages: list[dict]) -> list[dict]:
+    """Re-synthesize missing tool_call ids and pair them onto following tool msgs.
+
+    The tree stores tool_calls via ``tool_call_dict`` which deliberately drops the
+    wire id (so a generated turn compares dict-equal to its replayed echo). But
+    vLLM 0.26 requires every tool_call to carry an ``id`` and the tool message a
+    matching ``tool_call_id``. We emit one positional id per assistant tool_call
+    (``call_0``, ``call_1``, ...) and assign it to the next ``len(tool_calls)``
+    tool messages in order — mirroring hub_to_anthropic. Tree is untouched.
+    """
+    out: list[dict] = []
+    counter = 0
+    pending: list[str] = []  # ids emitted by the last assistant turn, awaiting tool msgs
+    for m in messages:
+        if not isinstance(m, dict):
+            out.append(m)
+            continue
+        role = m.get("role")
+        if role == "assistant" and isinstance(m.get("tool_calls"), list):
+            m2 = dict(m)
+            tcs = []
+            pending = []
+            for tc in m["tool_calls"]:
+                if not isinstance(tc, dict):
+                    tcs.append(tc)
+                    continue
+                tc2 = dict(tc)
+                tid = tc2.get("id") or f"call_{counter}"
+                if not tc2.get("id"):
+                    counter += 1
+                tc2["id"] = tid
+                tc2.setdefault("type", "function")
+                pending.append(tid)
+                tcs.append(tc2)
+            m2["tool_calls"] = tcs
+            out.append(m2)
+        elif role == "tool":
+            m2 = dict(m)
+            if not m2.get("tool_call_id") and pending:
+                m2["tool_call_id"] = pending.pop(0)
+            out.append(m2)
+        else:
+            out.append(m)
     return out
 
 
@@ -748,20 +865,22 @@ class BaseAdapter:
             return [], []
         return token_ids, log_probs
 
-    async def _chat_upstream_token_ids(
+    async def _chat_upstream_token_ids_and_logprobs(
         self, base_url: str, api_key: str, kwargs: dict, session_id: str | None
-    ) -> list[int] | None:
-        """Re-issue the chat call over plain HTTP to recover sampled token ids.
+    ) -> tuple[list[int] | None, list[float] | None]:
+        """Re-issue the chat call over plain HTTP to recover ids AND logprobs together.
 
         litellm <= 1.88 keeps ``extra_body`` nested, so vLLM (>=0.10.2) returns
         ``token_ids: None`` even with the flag set. We reach here only when the
-        litellm path already returned logprobs but no ids -- so this is a recovery
-        on a path that was otherwise about to drop the logprobs. Sending
-        ``return_token_ids`` at the top level (not in extra_body) is what vLLM
-        actually reads. One extra request beats silently losing token-level data.
+        litellm path already returned logprobs but no ids. Re-issuing over plain
+        HTTP with ``return_token_ids`` at the top level returns BOTH token_ids and
+        logprobs from the SAME response — critical for alignment, because logprobs
+        (from the litellm call) and ids (from a separate call) can differ in length
+        when generation is non-deterministic (reasoning tokens). Using the raw
+        response's own paired logprobs guarantees ``len(ids) == len(logprobs)``.
         """
         if not base_url:
-            return None
+            return None, None
         url = base_url.rstrip("/")
         if not url.endswith("/chat/completions"):
             url = f"{url}/chat/completions"
@@ -771,6 +890,8 @@ class BaseAdapter:
         }
         payload["model"] = str(kwargs.get("model", "")).split("/", 1)[-1]
         payload["return_token_ids"] = True  # top-level, the only place vLLM reads it
+        if kwargs.get("logprobs"):
+            payload["logprobs"] = True
         headers = {"Content-Type": "application/json"}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
@@ -779,20 +900,127 @@ class BaseAdapter:
             async with aiohttp.ClientSession() as sess:
                 async with sess.post(url, json=payload, headers=headers) as resp:
                     if resp.status >= 400:
-                        return None
+                        return None, None
                     data = json.loads(await resp.text())
         except Exception:
-            return None
+            return None, None
         choice = (data.get("choices") or [{}])[0]
         ids = choice.get("token_ids")
-        if isinstance(ids, list) and ids and all(isinstance(i, int) for i in ids):
+        ids = list(ids) if isinstance(ids, list) and ids and all(isinstance(i, int) for i in ids) else None
+        # logprobs from the SAME response (OpenAI shape: choices[0].logprobs.content)
+        lp_entries = (choice.get("logprobs") or {}).get("content") or []
+        lps = [float(e["logprob"]) for e in lp_entries if isinstance(e, dict) and e.get("logprob") is not None] or None
+        if ids is not None:
             self.logger.info(
-                "[%s] sid=%s recovered %d token ids via raw HTTP (litellm extra_body "
-                "not flattened); ids now TITO-safe",
-                self.log_prefix, session_id, len(ids),
+                "[%s] sid=%s recovered %d token ids + %d logprobs via raw HTTP "
+                "(litellm extra_body not flattened); ids now TITO-safe",
+                self.log_prefix, session_id, len(ids), len(lps or []),
             )
-            return list(ids)
-        return None
+        return ids, lps
+
+    async def _call_chat_upstream_raw(
+        self,
+        translated: list[dict],
+        tools_schema: list[dict] | None,
+        body: dict,
+        session_id: str | None,
+    ) -> dict:
+        """POST /chat/completions over plain HTTP, bypassing litellm's request validator.
+
+        litellm 1.88's request-body validator rejects the OpenAI-standard
+        ``tool_calls[].type == "function"`` shape on vLLM 0.26 (expects a
+        non-standard ChatCompletionMessageCustomToolCallParam). So any chat
+        request that replays an assistant tool_call — every post-tool agentic
+        turn — must bypass litellm. This issues the call directly and parses the
+        same response shape litellm would have returned, in ONE request, so
+        token_ids and logprobs are paired (same-response, TITO-safe).
+
+        Returns a dict with: blocks, stop_reason, usage, output_ids, output_log_probs.
+        """
+        from anyharness.adapters.anthropic import chat_response_to_blocks
+
+        base_url = os.environ.get("SLIME_CHAT_BASE_URL") or ""
+        base_url = base_url.rstrip("/")
+        if not base_url.endswith("/v1"):
+            base_url = base_url + "/v1"
+        api_key = os.environ.get("SLIME_CHAT_API_KEY") or self._inbound_auth.get("authorization") or ""
+        if api_key.lower().startswith("bearer "):
+            api_key = api_key[7:]
+        model = os.environ.get("SLIME_CHAT_MODEL") or "gpt-4o"
+        args_as_dict = os.environ.get("SLIME_CHAT_ARGS_AS_DICT", "") == "1"
+        wire_messages = translated if args_as_dict else _stringify_tool_call_args(translated)
+        # vLLM 0.26 requires every tool_call to carry an `id` (and the following
+        # tool message a matching `tool_call_id`). The tree's tool_call_dict drops
+        # the wire id on purpose (for dict-equality matching), so re-synthesize one
+        # per assistant tool_call and pair it onto the following tool messages —
+        # positionally, like hub_to_anthropic does for the messages upstream.
+        wire_messages = _ensure_tool_call_ids(wire_messages)
+
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": wire_messages,
+            "stream": False,
+        }
+        if tools_schema:
+            payload["tools"] = tools_schema
+        if body.get("max_tokens"):
+            payload["max_tokens"] = int(body["max_tokens"])
+        want_logprobs = os.environ.get("SLIME_CHAT_LOGPROBS") == "1"
+        if want_logprobs:
+            payload["logprobs"] = True
+            top_k = int(os.environ.get("SLIME_CHAT_TOP_LOGPROBS", "0") or "0")
+            if top_k > 0:
+                payload["top_logprobs"] = top_k
+        payload["return_token_ids"] = True  # top-level, the only place vLLM reads it
+
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        extra = {k: v for k, v in self._inbound_auth.items() if k.lower() not in ("authorization",)}
+        headers.update(extra)
+        url = f"{base_url}/chat/completions"
+
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, sock_read=900)) as sess:
+            async with sess.post(url, json=payload, headers=headers) as resp:
+                if resp.status >= 400:
+                    text = await resp.text()
+                    raise RuntimeError(f"chat raw upstream {resp.status}: {text[:400]}")
+                data = await resp.json(content_type=None)
+
+        choice = (data.get("choices") or [{}])[0]
+        # build a litellm-shaped object so chat_response_to_blocks works
+        blocks, stop_reason = chat_response_to_blocks(_AttrView(data))
+
+        u = data.get("usage")
+        usage = None
+        if isinstance(u, dict):
+            usage = {
+                "input_tokens": u.get("prompt_tokens"),
+                "output_tokens": u.get("completion_tokens"),
+            }
+
+        output_ids: list[int] = []
+        output_log_probs: list[float] = []
+        if want_logprobs:
+            ids = choice.get("token_ids")
+            if isinstance(ids, list) and ids:
+                output_ids = [int(i) for i in ids]
+            lp_entries = (choice.get("logprobs") or {}).get("content") or []
+            output_log_probs = [float(e["logprob"]) for e in lp_entries
+                                 if isinstance(e, dict) and e.get("logprob") is not None]
+            if output_log_probs and len(output_log_probs) != len(output_ids):
+                self.logger.warning(
+                    "[%s] sid=%s chat raw ids (%d) != logprobs (%d); dropping logprobs",
+                    self.log_prefix, session_id, len(output_ids), len(output_log_probs))
+                output_log_probs = []
+
+        return {
+            "blocks": blocks,
+            "stop_reason": stop_reason,
+            "usage": usage,
+            "output_ids": output_ids,
+            "output_log_probs": output_log_probs,
+        }
 
     async def _call_chat_upstream(
         self,
@@ -916,15 +1144,20 @@ class BaseAdapter:
             except (AttributeError, IndexError, TypeError):
                 pass  # upstream didn't return logprobs despite the request
 
-        # litellm <= 1.88 ships `extra_body` nested instead of flattened to the
+        # litellm <= 1.88 keeps ``extra_body`` nested instead of flattened to the
         # top level, so vLLM (>=0.10.2) silently returns token_ids=None even with
-        # the flag set. Retry once over plain HTTP with return_token_ids at the
-        # top level -- the ids are the only TITO-safe source, so the extra request
-        # (only on a path that was about to drop the logprobs anyway) is worth it.
+        # the flag set. Re-issue over plain HTTP with return_token_ids at the top
+        # level — and take the logprobs from the SAME response, so ids and
+        # logprobs are paired (the litellm call's logprobs can differ in length
+        # from a separately-sampled raw call when generation is non-deterministic).
         if output_log_probs and not upstream_ids:
-            upstream_ids = await self._chat_upstream_token_ids(
+            raw_ids, raw_lps = await self._chat_upstream_token_ids_and_logprobs(
                 base_url, api_key, kwargs, session_id
             )
+            if raw_ids is not None:
+                upstream_ids = raw_ids
+                if raw_lps is not None:
+                    output_log_probs = raw_lps  # use the same-response logprobs
 
         # record_turn asserts len(output_log_probs) == len(output_ids); ids must come
         # from the upstream (TITO), never be re-derived here.

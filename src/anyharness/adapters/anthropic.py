@@ -240,6 +240,10 @@ class AnthropicAdapter(BaseAdapter):
                 else:
                     texts = [p.get("text", "") for p in content_parts if isinstance(p, dict)]
                     msg = {"role": role, "content": "".join(texts)}
+                # OpenAI Responses uses "developer" for the system prompt; the hub
+                # format (and chat templates) use "system", so normalize.
+                if msg["role"] == "developer":
+                    msg["role"] = "system"
                 if pending_reasoning and role == "assistant":
                     msg["reasoning_content"] = pending_reasoning
                     pending_reasoning = ""
