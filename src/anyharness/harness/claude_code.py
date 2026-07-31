@@ -175,7 +175,7 @@ class ClaudeCodeHarness:
 
     def __init__(self, *, model: str | None = None,
                  launch_flags: str | None = None,
-                 write_config: bool = True) -> None:
+                 preack_bypass: bool = True) -> None:
         """Configure the claude-code launch.
 
         Parameters
@@ -191,15 +191,36 @@ class ClaudeCodeHarness:
             locked root host, local dev, CI that forbids bypass), pass an
             alternative such as ``"--output-format stream-json --verbose"``
             combined with a ``--settings <file>`` (acceptEdits) path. The flags
-            must still emit ``stream-json`` for trajectory capture.
-        write_config:
-            Whether to pre-ack bypass-permissions via :meth:`write_config`.
-            Leave ``True`` with the default ``launch_flags``. Set ``False`` when
-            using a non-bypass launch (the bypass pre-ack is then irrelevant).
+            must still emit ``stream-json`` for trajectory capture. The string
+            is parsed with :func:`shlex.split` and each token is shell-quoted
+            before being joined into the command (so values containing spaces
+            must be quoted in the string, e.g.
+            ``--settings '/path with space/settings.json'``); this prevents
+            shell-injection and quoting breaks since the command runs through
+            ``bash -c``.
+        preack_bypass:
+            Whether to pre-ack bypass-permissions via :meth:`write_config`
+            before launching. Leave ``True`` when using the default
+            ``launch_flags`` (which enables bypass) — otherwise claude-code may
+            prompt on startup and block the run. Set ``False`` only with a
+            non-bypass ``launch_flags`` (the bypass pre-ack is then irrelevant).
+            ``ValueError`` is raised for the likely-incorrect combination of
+            the default (bypass) ``launch_flags`` with ``preack_bypass=False``.
         """
         self.model = model or os.environ.get("CLAUDE_MODEL", "slime-actor")
         self._launch_flags = launch_flags if launch_flags is not None else self.launch_flags
-        self._write_config = write_config
+        self._preack_bypass = preack_bypass
+        # Guard the likely-incorrect combination: default (bypass) launch_flags
+        # but the caller disabled the bypass pre-ack. A non-bypass launch_flags
+        # override is the only case where preack_bypass=False makes sense.
+        if not preack_bypass and "bypassPermissions" in self._launch_flags:
+            raise ValueError(
+                "preack_bypass=False is inconsistent with a launch_flags that "
+                "enables bypassPermissions (the default). Either keep "
+                "preack_bypass=True (default) with the default launch_flags, or "
+                "pass a non-bypass launch_flags (e.g. '--output-format "
+                "stream-json --verbose --settings <acceptEdits file>')."
+            )
 
     async def write_config(self, sb: Sandbox, workdir: str) -> None:
         """Pre-ack bypass-permissions so claude-code starts headless.
@@ -244,7 +265,7 @@ class ClaudeCodeHarness:
         ANTHROPIC_API_KEY so the adapter can forward it verbatim to the upstream.
 
         When ``launch_flags`` omits ``--permission-mode bypassPermissions`` (or
-        ``write_config=False``), the bypass pre-ack is skipped. The caller is
+        ``preack_bypass=False``), the bypass pre-ack is skipped. The caller is
         then responsible for headless execution — typically by including a
         ``--settings <file>`` with ``defaultMode: acceptEdits`` in
         ``launch_flags`` (and, if a global ``~/.claude/settings.json`` overrides
@@ -252,11 +273,16 @@ class ClaudeCodeHarness:
         token in that settings file's ``env`` block, since claude-code's
         ``--settings`` wins over the ambient environment and global settings).
         """
-        if self._write_config:
+        if self._preack_bypass:
             await self.write_config(sb, workdir)
 
         claude_bin = os.environ.get(self.claude_bin_env, "claude")
-        cmd = f"{shlex.quote(claude_bin)} -p {shlex.quote(prompt)} {self._launch_flags}"
+        # launch_flags is user-supplied and the command runs through `bash -c`
+        # (LocalSandbox.exec), so quote each token to prevent shell injection
+        # and quoting breaks on spaces (e.g. "--settings /path with space").
+        flag_tokens = shlex.split(self._launch_flags)
+        quoted_flags = " ".join(shlex.quote(t) for t in flag_tokens)
+        cmd = f"{shlex.quote(claude_bin)} -p {shlex.quote(prompt)} {quoted_flags}"
         # Carry the real upstream credential through to claude-code (it sends it
         # as the Authorization header, which the adapter forwards to the upstream).
         upstream_token = os.environ.get("ANTHROPIC_AUTH_TOKEN") or os.environ.get("ANTHROPIC_API_KEY")
